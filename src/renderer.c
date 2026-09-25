@@ -415,10 +415,13 @@ static void find_fbo_format(struct pass_state *pass)
 
     pl_fmt fmt = NULL;
     for (int i = 0; i < PL_ARRAY_SIZE(configs); i++) {
+        if (params->min_fbo_precision > 16 && configs[i].type != PL_FMT_FLOAT)
+            continue;
+        int depth = PL_MAX(configs[i].depth, params->min_fbo_precision);
         if (params->force_low_bit_depth_fbos && configs[i].depth > 8)
             continue;
 
-        fmt = pl_find_fmt(rr->gpu, configs[i].type, 4, configs[i].depth, 0,
+        fmt = pl_find_fmt(rr->gpu, configs[i].type, 4, depth, 0,
                           PL_FMT_CAP_RENDERABLE | configs[i].caps);
         if (!fmt)
             continue;
@@ -429,7 +432,7 @@ static void find_fbo_format(struct pass_state *pass)
         // back to the next biggest format
         for (int c = 3; c >= 1; c--) {
             pass->fbofmt[c] = pl_find_fmt(rr->gpu, configs[i].type, c,
-                                        configs[i].depth, 0, fmt->caps);
+                                        depth, 0, fmt->caps);
             pass->fbofmt[c] = PL_DEF(pass->fbofmt[c], pass->fbofmt[c+1]);
         }
         return;
