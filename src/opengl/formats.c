@@ -133,6 +133,14 @@ const struct gl_format formats_float32[] = {
     {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, S|L|F|V)},
 };
 
+// EXT_color_buffer_float does not require RGB32F rendering or float filtering.
+const struct gl_format formats_float32_gles[] = {
+    {GL_R32F,           R,     FLT, FMT("r32f",    32, FLOAT, S|F|V)},
+    {GL_RG32F,          RG,    FLT, FMT("rg32f",   32, FLOAT, S|F|V)},
+    {GL_RGB32F,         RGB,   FLT, FMT("rgb32f",  32, FLOAT, S|V)},
+    {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, S|F|V)},
+};
+
 // 16-bit floating point texture formats
 const struct gl_format formats_float16[] = {
     {GL_R16F,           R,     FLT,  FMT("r16f",    16, FLOAT, S|L|F)},
@@ -493,7 +501,10 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
         if (pl_opengl_has_ext(p->gl, "GL_EXT_texture_format_BGRA8888"))
             DO_FORMATS(formats_bgra_gles);
         DO_FORMATS(formats_uint);
-        DO_FORMATS(formats_basic_vertex);
+        if (pl_opengl_has_ext(p->gl, "GL_EXT_color_buffer_float"))
+            DO_FORMATS(formats_float32_gles);
+        else
+            DO_FORMATS(formats_basic_vertex);
         if (p->gles_ver >= 32 || pl_opengl_has_ext(p->gl, "GL_EXT_color_buffer_float")) {
             DO_FORMATS(formats_float16_fbo);
         } else {
