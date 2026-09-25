@@ -30,6 +30,7 @@
 
 enum {
     TMP_PRELUDE,   // GLSL version, global definitions, etc.
+    TMP_CUSTOM_PRELUDE, // custom extension directives, before declarations
     TMP_MAIN,      // main GLSL shader body
     TMP_VERT_HEAD, // vertex shader inputs/outputs
     TMP_VERT_BODY, // vertex shader body
@@ -302,6 +303,12 @@ static void generate_shaders(pl_dispatch dp,
     void *tmp = params->tmp;
     struct pass *pass = params->pass;
     struct pl_pass_params *pass_params = params->pass_params;
+    // Custom shader preludes can contain #extension directives. GLSL ES
+    // requires these before precision, uniform and interface declarations.
+    // Detach them before finalization concatenates the function body.
+    pl_str_builder custom_pre = dp->tmp[TMP_CUSTOM_PRELUDE];
+    pl_str_builder_concat(custom_pre, sh->buffers[SH_BUF_PRELUDE]);
+    pl_str_builder_reset(sh->buffers[SH_BUF_PRELUDE]);
     pl_str_builder shader_body = sh_finalize_internal(sh);
 
     pl_str_builder pre = dp->tmp[TMP_PRELUDE];
@@ -379,6 +386,8 @@ static void generate_shaders(pl_dispatch dp,
         ADD(pre, "#extension GL_EXT_shader_image_load_formatted : enable\n");
     if (has_gather && !gpu->glsl.gles)
         ADD(pre, "#extension GL_ARB_texture_gather : enable\n");
+
+    pl_str_builder_concat(pre, custom_pre);
 
     if (gpu->glsl.gles) {
         // Use 32-bit precision for floats if possible
