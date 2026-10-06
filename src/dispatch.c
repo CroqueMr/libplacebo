@@ -15,7 +15,6 @@
  * License along with libplacebo. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <math.h>
 #include "common.h"
 #include "log.h"
 #include "shaders.h"
@@ -30,7 +29,6 @@
 
 enum {
     TMP_PRELUDE,   // GLSL version, global definitions, etc.
-    TMP_CUSTOM_PRELUDE, // custom extension directives, before declarations
     TMP_MAIN,      // main GLSL shader body
     TMP_VERT_HEAD, // vertex shader inputs/outputs
     TMP_VERT_BODY, // vertex shader body
@@ -303,12 +301,6 @@ static void generate_shaders(pl_dispatch dp,
     void *tmp = params->tmp;
     struct pass *pass = params->pass;
     struct pl_pass_params *pass_params = params->pass_params;
-    // Custom shader preludes can contain #extension directives. GLSL ES
-    // requires these before precision, uniform and interface declarations.
-    // Detach them before finalization concatenates the function body.
-    pl_str_builder custom_pre = dp->tmp[TMP_CUSTOM_PRELUDE];
-    pl_str_builder_concat(custom_pre, sh->buffers[SH_BUF_PRELUDE]);
-    pl_str_builder_reset(sh->buffers[SH_BUF_PRELUDE]);
     pl_str_builder shader_body = sh_finalize_internal(sh);
 
     pl_str_builder pre = dp->tmp[TMP_PRELUDE];
@@ -386,8 +378,6 @@ static void generate_shaders(pl_dispatch dp,
         ADD(pre, "#extension GL_EXT_shader_image_load_formatted : enable\n");
     if (has_gather && !gpu->glsl.gles)
         ADD(pre, "#extension GL_ARB_texture_gather : enable\n");
-
-    pl_str_builder_concat(pre, custom_pre);
 
     if (gpu->glsl.gles) {
         // Use 32-bit precision for floats if possible
@@ -499,8 +489,7 @@ static void generate_shaders(pl_dispatch dp,
             if (gpu->glsl.vulkan) {
                 ADD(pre, "layout(binding=%d) uniform %c%s "$";\n",
                     desc->binding, prefix, type, id);
-            } else if (gpu->glsl.gles &&
-                       (prefix != ' ' || tex->params.format->component_depth[0] > 8)) {
+            } else if (gpu->glsl.gles && prefix != ' ') {
                 ADD(pre, "uniform highp %c%s "$";\n", prefix, type, id);
             } else {
                 ADD(pre, "uniform %c%s "$";\n", prefix, type, id);
@@ -1343,43 +1332,14 @@ bool pl_dispatch_finish(pl_dispatch dp, const struct pl_dispatch_params *params)
     if (rparams->vertex_data) {
         uintptr_t vert_base = (uintptr_t) rparams->vertex_data;
         size_t stride = rparams->pass->params.vertex_stride;
-        bool triangle = true;
-        for (int i = 0; i < sh->vas.num; i++) {
-            const struct pl_shader_va *sva = &sh->vas.elem[i];
-            const pl_fmt fmt = sva->attr.fmt;
-            triangle &= fmt->type == PL_FMT_FLOAT &&
-                        fmt->texel_size == 4 * fmt->num_components;
-            if (!triangle)
-                break;
-            const float *a = sva->data[0], *b = sva->data[1];
-            const float *c = sva->data[2], *d = sva->data[3];
-            for (int n = 0; n < fmt->num_components; n++) {
-                // Only affine attributes may be extended to one triangle.
-                // Preserve the original quad for arbitrary corner data.
-                triangle &= fmt->component_depth[n] == 32 &&
-                            isfinite(a[n]) && isfinite(b[n]) &&
-                            isfinite(c[n]) && isfinite(d[n]) &&
-                            d[n] == b[n] + c[n] - a[n];
-            }
-        }
-        rparams->vertex_count = triangle ? 3 : 4;
         for (int i = 0; i < sh->vas.num; i++) {
             const struct pl_shader_va *sva = &sh->vas.elem[i];
             struct pl_vertex_attrib *va = &rparams->pass->params.vertex_attribs[i];
 
             size_t size = sva->attr.fmt->texel_size;
             uintptr_t va_base = vert_base + va->offset; // use placed offset
-            for (int n = 0; n < rparams->vertex_count; n++) {
-                void *dest = (void *) (va_base + n * stride);
-                memcpy(dest, sva->data[n], size);
-                if (triangle && n) {
-                    float *out = dest;
-                    const float *origin = sva->data[0];
-                    const float *edge = sva->data[n];
-                    for (int c = 0; c < sva->attr.fmt->num_components; c++)
-                        out[c] = 2.0f * edge[c] - origin[c];
-                }
-            }
+            for (int n = 0; n < 4; n++)
+                memcpy((void *) (va_base + n * stride), sva->data[n], size);
         }
     }
 
