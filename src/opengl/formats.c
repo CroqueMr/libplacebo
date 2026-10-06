@@ -133,14 +133,6 @@ const struct gl_format formats_float32[] = {
     {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, S|L|F|V)},
 };
 
-// EXT_color_buffer_float does not require RGB32F rendering or float filtering.
-const struct gl_format formats_float32_gles[] = {
-    {GL_R32F,           R,     FLT, FMT("r32f",    32, FLOAT, S|F|V)},
-    {GL_RG32F,          RG,    FLT, FMT("rg32f",   32, FLOAT, S|F|V)},
-    {GL_RGB32F,         RGB,   FLT, FMT("rgb32f",  32, FLOAT, S|V)},
-    {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, S|F|V)},
-};
-
 // 16-bit floating point texture formats
 const struct gl_format formats_float16[] = {
     {GL_R16F,           R,     FLT,  FMT("r16f",    16, FLOAT, S|L|F)},
@@ -304,11 +296,6 @@ static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
     fmt->texel_align = 1;
     for (int i = 0; i < fmt->num_components; i++)
         fmt->host_bits[i] = size * 8;
-
-    if (p->gles_ver >= 30 && fmt->type == PL_FMT_FLOAT &&
-        fmt->component_depth[0] == 32 && (fmt->caps & PL_FMT_CAP_SAMPLEABLE) &&
-        pl_opengl_has_ext(p->gl, "GL_OES_texture_float_linear"))
-        fmt->caps |= PL_FMT_CAP_LINEAR;
 
     // Compute internal size by summing up the depth
     int ibits = 0;
@@ -506,10 +493,7 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
         if (pl_opengl_has_ext(p->gl, "GL_EXT_texture_format_BGRA8888"))
             DO_FORMATS(formats_bgra_gles);
         DO_FORMATS(formats_uint);
-        if (pl_opengl_has_ext(p->gl, "GL_EXT_color_buffer_float"))
-            DO_FORMATS(formats_float32_gles);
-        else
-            DO_FORMATS(formats_basic_vertex);
+        DO_FORMATS(formats_basic_vertex);
         if (p->gles_ver >= 32 || pl_opengl_has_ext(p->gl, "GL_EXT_color_buffer_float")) {
             DO_FORMATS(formats_float16_fbo);
         } else {

@@ -340,10 +340,6 @@ struct pl_render_params {
     // disabling linear scaling and sigmoidization.
     bool force_low_bit_depth_fbos;
 
-    // Minimum component precision for intermediate textures (0: default).
-    // A value of 32 requires floating-point intermediates without a lower-depth fallback.
-    int min_fbo_precision;
-
     // If this is true, all shaders will be generated as "dynamic" shaders,
     // with any compile-time constants being replaced by runtime-adjustable
     // values. This is generally a performance loss, but has the advantage of
