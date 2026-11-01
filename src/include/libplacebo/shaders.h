@@ -63,6 +63,9 @@ struct pl_shader_params {
     // dynamic variables. This is mainly useful to avoid recompilation for
     // shaders which expect to have their values change constantly.
     bool dynamic_constants;
+    // CB policy-only equivalent ST2084 FP32 realization, default off.
+    // Matched modified headers and library are required.
+    bool cb1_stable_pq;
 };
 
 #define pl_shader_params(...) (&(struct pl_shader_params) { __VA_ARGS__ })

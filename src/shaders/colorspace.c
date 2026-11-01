@@ -23,6 +23,73 @@
 
 #include <libplacebo/shaders/colorspace.h>
 
+// Original ST2084 constants, guards and domain. Avoid a rounded near-unity root.
+// Fixed expm1 P5(z/16) seed and four doublings; analytic 1/n! coefficients,
+// bounded primitive approximation, not a fitted curve or an exact identity.
+static void cb1_pq_eotf(pl_shader sh, const char *signal)
+{
+    GLSL("{ for (int cb1_pq_i = 0; cb1_pq_i < 3; cb1_pq_i++) {\n"
+         "float cb1_pq_q = %s[cb1_pq_i];\n"
+         "if (cb1_pq_q <= 0.0) { %s[cb1_pq_i] = 0.0; } else {\n"
+         "float cb1_pq_log = log(cb1_pq_q), cb1_pq_z = cb1_pq_log / 78.84375, cb1_pq_y = cb1_pq_z / 16.0;\n"
+         "float cb1_pq_d = -cb1_pq_y * (1.0 + cb1_pq_y * (0.5 + cb1_pq_y * ((1.0/6.0) + cb1_pq_y * ((1.0/24.0) + cb1_pq_y/120.0))));\n"
+         "cb1_pq_d = cb1_pq_d * (2.0 - cb1_pq_d);\n"
+         "cb1_pq_d = cb1_pq_d * (2.0 - cb1_pq_d);\n"
+         "cb1_pq_d = cb1_pq_d * (2.0 - cb1_pq_d);\n"
+         "cb1_pq_d = cb1_pq_d * (2.0 - cb1_pq_d);\n"
+         "%s[cb1_pq_i] = max(0.1640625 - cb1_pq_d, 0.0) / (0.1640625 + 18.6875 * cb1_pq_d);\n"
+         "} } }\n"
+         "%s = pow(%s, vec3(1.0/0.1593017578125));\n",
+         signal, signal, signal, signal, signal);
+}
+
+static void cb1_pq_oetf(pl_shader sh, const char *signal)
+{
+    GLSL("{\n"
+         "vec3 v = pow(max(%s, 0.0), vec3(0.1593017578125));\n"
+         "v = vec3(1.0) - 0.1640625 * (vec3(1.0) - v) / (vec3(1.0) + 18.6875 * v);\n"
+         "vec3 v2=v*v, v4=v2*v2, v8=v4*v4, v16=v8*v8, v32=v16*v16, v64=v32*v32;\n"
+         "%s = ((v64*v8)*v4)*v2*pow(v, vec3(0.84375));\n"
+         "}\n", signal, signal);
+}
+
+static void cb1_colour_dense_eotf(pl_shader sh)
+{
+    if (SH_PARAMS(sh).cb1_stable_pq) {
+        cb1_pq_eotf(sh,"color.rgb");
+    } else {
+        GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(1.0/%f));   \n"
+             "color.rgb = max(color.rgb - vec3(%f), 0.0)            \n"
+             "             / (vec3(%f) - vec3(%f) * color.rgb);     \n"
+             "color.rgb = pow(color.rgb, vec3(1.0/%f));             \n",
+             PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1);
+    }
+}
+
+static bool cb1_colour_lookup(pl_shader sh, const struct pl_cb1_dovi_processing *p,
+                              bool encode)
+{
+    /* Public processing ABI: one 4096-entry table for each PQ direction. */
+    if (!p || !(p->groups & 8)) return false;
+    pl_tex texture = p->pq_texture[encode ? 1 : 0];
+    if (!texture) return false;
+    ident_t sample = sh_bind(sh, texture, PL_TEX_ADDRESS_CLAMP,
+                            PL_TEX_SAMPLE_LINEAR, "cb1_colour_lut", NULL, NULL, NULL);
+    const double domain[2][2] = {{0.02, 0.98}, {0.0000152587890625, 0.95}};
+    if (!encode) GLSL("vec3 cb1_pq_source=color.rgb;bool cb1_decode_coarse=false;\n");
+    GLSL("if(all(greaterThan(color.rgb,vec3("$"))) && all(lessThan(color.rgb,vec3("$")))){\n",
+         SH_FLOAT(domain[encode][0]), SH_FLOAT(domain[encode][1]));
+    GLSL(encode ? "vec3 cb1_pos=sqrt(sqrt(color.rgb));\n" :
+                  "cb1_decode_coarse=true;vec3 cb1_pos=color.rgb;\n");
+    GLSL("cb1_pos=(cb1_pos*4095.0+vec3(0.5))/4096.0;\ncolor.rgb=vec3(\n");
+    const char *lanes[] = {"r", "g", "b"};
+    for (int c = 0; c != 3; c++)
+        GLSL("texture("$",vec2(cb1_pos.%s,0.5)).r%s\n", sample, lanes[c], c == 2 ? ");" : ",");
+    GLSL("}else{\n");
+    return true;
+}
+
+
 void pl_shader_set_alpha(pl_shader sh, struct pl_color_repr *repr,
                          enum pl_alpha_mode mode)
 {
@@ -60,7 +127,7 @@ static inline void reshape_mmr(pl_shader sh, ident_t mmr, bool single,
 
     assert(min_order <= max_order);
     if (min_order < max_order)
-        GLSL("uint order = uint(coeffs.w); \n");
+        GLSL("int order = int(coeffs.w); \n");
 
     GLSL("vec4 sigX;                            \n"
          "s = coeffs.x;                         \n"
@@ -101,6 +168,40 @@ static inline void reshape_poly(pl_shader sh)
 {
     GLSL("s = (coeffs.z * s + coeffs.y) * s + coeffs.x; \n");
 }
+
+static bool reshape_univariate_mmr(pl_shader sh, const struct pl_reshape_data *comp,
+                                  int channel)
+{
+    if (comp->num_pivots != 2 || comp->method[0] != 1 ||
+        comp->mmr_order[0] < 1 || comp->mmr_order[0] > 3)
+        return false;
+    for (int order = 0; order < comp->mmr_order[0]; order++) {
+        for (int term = 0; term < 7; term++) {
+            if (term != channel && comp->mmr_coeffs[0][order][term] != 0.0f)
+                return false;
+        }
+    }
+
+    float values[4] = {comp->mmr_constant[0]};
+    for (int order = 0; order < comp->mmr_order[0]; order++)
+        values[order + 1] = comp->mmr_coeffs[0][order][channel];
+    ident_t coeff = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_vec4("univariate_mmr"), .data = values,
+    });
+    float bounds[2] = {comp->pivots[0], comp->pivots[1]};
+    ident_t limits = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_vec2("univariate_bounds"), .data = bounds,
+    });
+    // Preserve order-by-order accumulation, not a Horner polynomial rewrite.
+    GLSL("{ float x = sig[%d]; s = "$".x; s += "$".y * x; \n",
+         channel, coeff, coeff);
+    if (comp->mmr_order[0] >= 2)
+        GLSL("float x2 = x * x; s += "$".z * x2; \n", coeff);
+    if (comp->mmr_order[0] >= 3)
+        GLSL("s += "$".w * (x2 * x); \n", coeff);
+    GLSL("color[%d] = clamp(s, "$".x, "$".y); } \n", channel, limits, limits);
+    return true;
+}
 #endif
 
 void sh_dovi_compose_nlq(pl_shader sh, const struct pl_dovi_metadata *data,
@@ -138,15 +239,61 @@ void sh_dovi_compose_nlq(pl_shader sh, const struct pl_dovi_metadata *data,
     // pl_map_dovi_metadata, so the per-pixel form collapses to:
     //   residual = sign(el_centered) * (|el_centered| * slope + threshold)
     // sign(0) == 0 covers the spec's rr==0 carve-out exactly.
+    // Filtering/normalization can move a neutral sample by float roundoff.
+    // Do not turn a two-ULP cancellation error into a half-code residual.
 #pragma GLSL /* sh_dovi_compose_nlq */                                  \
     {                                                                   \
-    vec3 el_centered = $el_signal().rgb - $off;                         \
-    color.rgb += sign(el_centered) * (abs(el_centered) * $slp + $thr);  \
+    vec3 el_sample = $el_signal().rgb;                                \
+    vec3 el_centered = el_sample - $off;                              \
+    vec3 noise = 2.384185791015625e-7 * max(abs(el_sample), abs($off)); \
+    el_centered = mix(el_centered, vec3(0.0), lessThanEqual(abs(el_centered), noise)); \
+    vec3 residual = sign(el_centered) * (abs(el_centered) * $slp + $thr);
+    if (data->cb1_native_bounds) {
+        ident_t maximum = sh_var(sh, (struct pl_shader_var) {
+            .var=pl_var_vec3("nlq_max"), .data=data->cb1_nlq_max,
+        });
+        GLSL("residual=clamp(residual,-"$","$");\n",maximum,maximum);
     }
+    GLSL("color.rgb += residual; }\n");
 #endif
 }
 
-void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
+/* Evaluate the processing ABI's axis tables and the remaining MMR cross terms.
+ * Keep axis/order accumulation and clamping identical to the numerical contract. */
+static bool cb1_reshape_texture(pl_shader sh, const struct pl_cb1_dovi_processing *p,
+                               const struct pl_reshape_data *curve, int channel, ident_t texture)
+{
+    if (!p || !texture) return false;
+    unsigned component = 1u << channel;
+    if (p->poly_components & component) {
+        ident_t row = SH_FLOAT((channel * 3 + 0.5) / 9.0);
+        ident_t low = SH_FLOAT_DYN(curve->pivots[0]);
+        ident_t high = SH_FLOAT_DYN(curve->pivots[curve->num_pivots - 1]);
+        GLSL("color[%d]=clamp(texture("$",vec2((sig[%d]*1023.0+0.5)/1024.0,"$")).r,"$","$");\n",
+             channel, texture, channel, row, low, high);
+        return true;
+    }
+    if (!(p->narrow_components & component)) return false;
+    GLSL("s="$";\n", SH_FLOAT_DYN(curve->mmr_constant[0]));
+    for (int axis = 0; axis != 3; axis++) {
+        ident_t row = SH_FLOAT((channel * 3 + axis + 0.5) / 9.0);
+        GLSL("s+=texture("$",vec2((sig[%d]*1023.0+0.5)/1024.0,"$")).r;\n", texture, axis, row);
+    }
+    GLSL("{vec4 cross1=vec4(sig.x*sig.y,sig.x*sig.z,sig.y*sig.z,sig.x*sig.y*sig.z);\n");
+    const char *terms[] = {"cross1", "cross1*cross1", "cross1*cross1*cross1"};
+    for (int order = 0; order < curve->mmr_order[0]; order++) {
+        ident_t weights = sh_var(sh, (struct pl_shader_var){.var=pl_var_vec4("cb1_cross"),
+            .data=&curve->mmr_coeffs[0][order][3]});
+        GLSL("s+=dot("$",%s);\n", weights, terms[order]);
+    }
+    ident_t low = SH_FLOAT_DYN(curve->pivots[0]);
+    ident_t high = SH_FLOAT_DYN(curve->pivots[curve->num_pivots - 1]);
+    GLSL("color[%d]=clamp(s,"$","$");}\n", channel, low, high);
+    return true;
+}
+
+static void dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data,
+                         const struct pl_cb1_dovi_processing *processing)
 {
 #ifdef PL_HAVE_DOVI
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0) || !data)
@@ -159,9 +306,24 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
          "vec4 coeffs;                          \n"
          "float s;                              \n"
          "sig = clamp(color.rgb, 0.0, 1.0);     \n");
+    if (data->cb1_native_bounds) {
+        float lo[3]={0},hi[3]={1,1,1};
+        for(int c=0;c<3;c++)if(data->comp[c].num_pivots>=2){
+            lo[c]=data->comp[c].pivots[0];
+            hi[c]=data->comp[c].pivots[data->comp[c].num_pivots-1];
+        }
+        ident_t lower=sh_var(sh,(struct pl_shader_var){.var=pl_var_vec3("input_min"),.data=lo});
+        ident_t upper=sh_var(sh,(struct pl_shader_var){.var=pl_var_vec3("input_max"),.data=hi});
+        GLSL("sig=clamp(sig,"$","$");\n",lower,upper);
+    }
 
     float coeffs_data[8][4];
     float mmr_packed_data[8*6][4];
+    ident_t mmr_lut=NULL_IDENT;
+    if (processing && (processing->groups&3) && processing->mmr_texture &&
+        (processing->narrow_components || processing->poly_components))
+        mmr_lut=sh_bind(sh,processing->mmr_texture,PL_TEX_ADDRESS_CLAMP,
+            PL_TEX_SAMPLE_LINEAR,"cb1_mmr",NULL,NULL,NULL);
 
     for (int c = 0; c < 3; c++) {
         const struct pl_reshape_data *comp = &data->comp[c];
@@ -169,6 +331,64 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
             continue;
 
         pl_assert(comp->num_pivots >= 2 && comp->num_pivots <= 9);
+        struct pl_reshape_data bounded;
+        if(data->cb1_native_bounds){
+            bounded=*comp;
+            bounded.pivots[0]=0;
+            bounded.pivots[bounded.num_pivots-1]=1;
+            comp=&bounded;
+        }
+        struct pl_reshape_data compact;
+        bool common_mmr = comp->num_pivots > 2 && comp->method[0] == 1;
+        for (int i = 1; common_mmr && i < comp->num_pivots - 1; i++)
+            common_mmr = comp->method[i] == 1 && comp->mmr_order[i] == comp->mmr_order[0] &&
+                !memcmp(&comp->mmr_constant[i], &comp->mmr_constant[0], sizeof(float)) &&
+                !memcmp(comp->mmr_coeffs[i], comp->mmr_coeffs[0], sizeof(comp->mmr_coeffs[0]));
+        if (common_mmr) {
+            // Identical intervals share coefficients and the original outer bounds.
+            compact = *comp;
+            compact.pivots[1] = comp->pivots[comp->num_pivots - 1];
+            compact.num_pivots = 2;
+            comp = &compact;
+        }
+        bool polynomial = comp->num_pivots > 2;
+        for (int i = 0; polynomial && i < comp->num_pivots - 1; i++)
+            polynomial = comp->method[i] == 0;
+        if (polynomial) {
+            compact = *comp;
+            int segments = 1;
+            for (int i = 1; i < comp->num_pivots - 1; i++) {
+                // Adjacent bit-identical polynomials share one interval.
+                if (!memcmp(comp->poly_coeffs[i], compact.poly_coeffs[segments - 1],
+                            sizeof(comp->poly_coeffs[i])))
+                    continue;
+                compact.pivots[segments] = comp->pivots[i];
+                memcpy(compact.poly_coeffs[segments], comp->poly_coeffs[i],
+                       sizeof(comp->poly_coeffs[i]));
+                segments++;
+            }
+            compact.pivots[segments] = comp->pivots[comp->num_pivots - 1];
+            compact.num_pivots = segments + 1;
+            comp = &compact;
+        }
+        // Identity segments need no coefficient selection or polynomial evaluation.
+        bool identity = comp->pivots[0] == 0.0f &&
+                        comp->pivots[comp->num_pivots - 1] == 1.0f;
+        for (int i = 0; identity && i < comp->num_pivots - 1; i++) {
+            identity = comp->method[i] == 0 &&
+                       comp->poly_coeffs[i][0] == 0.0f &&
+                       comp->poly_coeffs[i][1] == 1.0f &&
+                       comp->poly_coeffs[i][2] == 0.0f;
+        }
+        if (identity) {
+            GLSL("color[%d] = sig[%d]; \n", c, c);
+            continue;
+        }
+        if (cb1_reshape_texture(sh, processing, comp, c, mmr_lut)) {
+            continue;
+        }
+        if (reshape_univariate_mmr(sh, comp, c))
+            continue;
         GLSL("s = sig[%d]; \n", c);
 
         // Prepare coefficients for GPU
@@ -245,19 +465,24 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
                 },
             });
 
-            // Efficiently branch into the correct set of coefficients
-            GLSL("#define test(i) bvec4(s >= "$"[i])                \n"
-                 "#define coef(i) "$"[i]                            \n"
-                 "coeffs = mix(mix(mix(coef(0), coef(1), test(0)),  \n"
-                 "                 mix(coef(2), coef(3), test(2)),  \n"
-                 "                 test(1)),                        \n"
-                 "             mix(mix(coef(4), coef(5), test(4)),  \n"
-                 "                 mix(coef(6), coef(7), test(6)),  \n"
-                 "                 test(5)),                        \n"
-                 "             test(3));                            \n"
-                 "#undef test                                       \n"
-                 "#undef coef                                       \n",
-                 pivots, coeffs);
+            if (comp->num_pivots <= 4) {
+                GLSL("coeffs = mix("$"[0], "$"[1], bvec4(s >= "$"[0])); \n",
+                     coeffs, coeffs, pivots);
+                if (comp->num_pivots == 4)
+                    GLSL("coeffs = mix(coeffs, "$"[2], bvec4(s >= "$"[1])); \n",
+                         coeffs, pivots);
+            } else {
+                // Select one segment with three comparisons instead of seven vec4 mixes.
+                GLSL("{                                                \n"
+                 "#define pivot(i) "$"[i]                          \n"
+                 "int segment = int(s >= pivot(3)) * 4;             \n"
+                 "segment += int(s >= pivot(segment + 1)) * 2;      \n"
+                 "segment += int(s >= pivot(segment));              \n"
+                 "coeffs = "$"[segment];                           \n"
+                 "#undef pivot                                      \n"
+                 "}                                                 \n",
+                     pivots, coeffs);
+            }
 
         } else {
 
@@ -315,36 +540,58 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
 #endif
 }
 
+void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
+{
+    dovi_reshape(sh,data,NULL);
+}
+
+unsigned pl_cb1_processing_abi(void)
+{
+    return PL_CB1_PROCESSING_ABI;
+}
+
+unsigned pl_cb1_dovi_reference_abi(void)
+{
+    return PL_CB1_DOVI_REFERENCE_ABI;
+}
+
+void pl_shader_dovi_reconstruct(pl_shader sh, struct pl_color_repr *repr,
+                                 pl_shader enhancement_layer)
+{
+    pl_shader_dovi_reconstruct_ex(sh, repr, enhancement_layer, NULL);
+}
+
+void pl_shader_dovi_reconstruct_ex(pl_shader sh, struct pl_color_repr *repr,
+    pl_shader enhancement_layer, const struct pl_cb1_dovi_processing *processing)
+{
+    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
+        return;
+    if (!repr || repr->sys != PL_COLOR_SYSTEM_DOLBYVISION || !repr->dovi) {
+        SH_FAIL(sh, "DOVI reconstruction requires source representation and metadata");
+        return;
+    }
+    ident_t scale = SH_FLOAT(pl_color_repr_normalize(repr));
+    GLSL("color.rgb *= vec3("$"); \n", scale);
+    dovi_reshape(sh, repr->dovi, processing);
+    if (enhancement_layer && repr->dovi->nlq_active) {
+        ident_t el = sh_subpass(sh, enhancement_layer);
+        if (el)
+            sh_dovi_compose_nlq(sh, repr->dovi, el);
+    }
+}
+
 void pl_shader_decode_color_ex(pl_shader sh,
                                const struct pl_color_decode_args *args)
 {
     struct pl_color_repr *repr = args->repr;
     const struct pl_color_adjustment *params = args->color_adjustment;
-
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
-
     sh_describe(sh, "color decoding");
     GLSL("// pl_shader_decode_color \n"
          "{ \n");
-
     if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
-    {
-        ident_t scale = SH_FLOAT(pl_color_repr_normalize(repr));
-        GLSL("color.rgb *= vec3("$"); \n", scale);
-    }
-
-    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
-        pl_shader_dovi_reshape(sh, repr->dovi);
-
-    // Dolby Vision FEL composition
-    if (args->enhancement_layer && repr->sys == PL_COLOR_SYSTEM_DOLBYVISION &&
-        repr->dovi && repr->dovi->nlq_active)
-    {
-        ident_t el = sh_subpass(sh, args->enhancement_layer);
-        if (el)
-            sh_dovi_compose_nlq(sh, repr->dovi, el);
-    }
+        pl_shader_dovi_reconstruct_ex(sh, repr, args->enhancement_layer, args->cb1_processing);
 
     enum pl_color_system orig_sys = repr->sys;
     pl_transform3x3 tr = pl_color_repr_decode(repr, params);
@@ -461,19 +708,36 @@ void pl_shader_decode_color_ex(pl_shader sh,
         });
 
         // PQ EOTF
-        GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(1.0/%f));   \n"
-             "color.rgb = max(color.rgb - vec3(%f), 0.0)            \n"
-             "             / (vec3(%f) - vec3(%f) * color.rgb);     \n"
-             "color.rgb = pow(color.rgb, vec3(1.0/%f));             \n",
-             PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1);
+        bool coarse_decode=cb1_colour_lookup(sh,args->cb1_processing,false);
+        cb1_colour_dense_eotf(sh);
+        if (coarse_decode) GLSL("}\n");
         // LMS matrix
         GLSL("color.rgb = "$" * color.rgb; \n", mat);
-        // PQ OETF
-        GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(%f));       \n"
-             "color.rgb = (vec3(%f) + vec3(%f) * color.rgb)         \n"
-             "             / (vec3(1.0) + vec3(%f) * color.rgb);    \n"
-             "color.rgb = pow(color.rgb, vec3(%f));                 \n",
-             PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
+        if (coarse_decode) {
+            /* Cancellation before PQ encoding amplifies small linear errors. */
+            GLSL("if(cb1_decode_coarse && any(lessThan(color.rgb,vec3(0.001)))) {\n"
+                 "color.rgb=cb1_pq_source;\n");
+            cb1_colour_dense_eotf(sh);
+            GLSL("color.rgb = "$" * color.rgb;\n}\n",mat);
+        }
+        if (args->cb1_dovi_linear) {
+            // Match pl_shader_linearize(PQ): 203-nit-relative linear RGB.
+            GLSL("color.rgb = max(color.rgb, 0.0) * vec3(%f); \n",
+                 10000.0 / PL_COLOR_SDR_WHITE);
+        } else {
+            // PQ OETF
+            bool coarse_encode=cb1_colour_lookup(sh,args->cb1_processing,true);
+            if (SH_PARAMS(sh).cb1_stable_pq) {
+                cb1_pq_oetf(sh, "color.rgb");
+            } else {
+                GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(%f));       \n"
+                     "color.rgb = (vec3(%f) + vec3(%f) * color.rgb)         \n"
+                     "             / (vec3(1.0) + vec3(%f) * color.rgb);    \n"
+                     "color.rgb = pow(color.rgb, vec3(%f));                 \n",
+                     PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
+            }
+            if (coarse_encode) GLSL("}\n");
+        }
         break;
 #else
         SH_FAIL(sh, "libplacebo was compiled without support for dolbyvision reshaping");
@@ -721,6 +985,11 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
         GLSL("color.rgb = vec3(52.37/48.0) * pow(color.rgb, vec3(2.6));\n");
         goto scale_out;
     case PL_COLOR_TRC_PQ:
+        if (SH_PARAMS(sh).cb1_stable_pq) {
+            cb1_pq_eotf(sh, "color.rgb");
+            GLSL("color.rgb *= vec3(%f);\n", 10000.0 / PL_COLOR_SDR_WHITE);
+            return;
+        }
         GLSL("color.rgb = pow(color.rgb, vec3(1.0/%f));         \n"
              "color.rgb = max(color.rgb - vec3(%f), 0.0)        \n"
              "             / (vec3(%f) - vec3(%f) * color.rgb); \n"
@@ -860,6 +1129,11 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
              "                lessThanEqual(vec3(0.001953), color.rgb));     \n");
         return;
     case PL_COLOR_TRC_PQ:
+        if (SH_PARAMS(sh).cb1_stable_pq) {
+            GLSL("color.rgb *= vec3(1.0/%f);\n", 10000 / PL_COLOR_SDR_WHITE);
+            cb1_pq_oetf(sh, "color.rgb");
+            return;
+        }
         GLSL("color.rgb *= vec3(1.0/%f);                         \n"
              "color.rgb = pow(color.rgb, vec3(%f));              \n"
              "color.rgb = (vec3(%f) + vec3(%f) * color.rgb)      \n"
@@ -1692,6 +1966,13 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         return;
 
     struct pl_color_space src = args->src, dst = args->dst;
+    params = PL_DEF(params, &pl_color_map_default_params);
+    const bool cb1_neutral_cm29 = params->cb1_neutral_cm29 &&
+        args->prelinearized && dst.transfer == PL_COLOR_TRC_LINEAR &&
+        src.primaries == PL_COLOR_PRIM_BT_2020 &&
+        isfinite(params->cb1_neutral_cm29_peak) &&
+        params->cb1_neutral_cm29_peak > 0.0f &&
+        params->cb1_neutral_cm29_peak <= 10000.0f;
     struct sh_color_map_obj *obj = NULL;
     if (args->state) {
         pl_get_detected_hdr_metadata(*args->state, &src.hdr);
@@ -1702,13 +1983,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     }
 
     pl_color_space_infer_map(&src, &dst);
-    if (pl_color_space_equal(&src, &dst)) {
+    if (pl_color_space_equal(&src, &dst) && !cb1_neutral_cm29) {
         if (args->prelinearized)
             pl_shader_delinearize(sh, &dst);
         return;
     }
 
-    params = PL_DEF(params, &pl_color_map_default_params);
     GLSL("// pl_shader_color_map \n"
          "{                      \n");
 
@@ -1765,7 +2045,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     struct pl_gamut_map_params gamut = {
         .function        = PL_DEF(params->gamut_mapping, &pl_gamut_map_clip),
         .constants       = params->gamut_constants,
-        .input_gamut     = src.hdr.prim,
+        .input_gamut     = cb1_neutral_cm29 ?
+                           *pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020) : src.hdr.prim,
         .output_gamut    = dst.hdr.prim,
         .lut_size_I      = PL_DEF(params->lut3d_size[0], lut3d_size_def[0]),
         .lut_size_C      = PL_DEF(params->lut3d_size[1], lut3d_size_def[1]),
@@ -1846,9 +2127,17 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
 
     bool need_tone_map = !pl_tone_map_params_noop(&tone);
     bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
+    bool cb1_direct_rgb_output = cb1_neutral_cm29 && !need_gamut_map &&
+                                 src.primaries == dst.primaries;
 
     if (!args->prelinearized)
         pl_shader_linearize(sh, &src);
+
+    // Preserve the neutral CM29 first-map clamp before any fast return.
+    if (cb1_neutral_cm29 && !need_tone_map) {
+        GLSL("color.rgb = clamp(color.rgb, 0.0, %f);\n",
+             params->cb1_neutral_cm29_peak / PL_COLOR_SDR_WHITE);
+    }
 
     pl_matrix3x3 rgb2lms = pl_ipt_rgb2lms(pl_raw_primaries_get(src.primaries));
     pl_matrix3x3 lms2rgb = pl_ipt_lms2rgb(pl_raw_primaries_get(dst.primaries));
@@ -1875,6 +2164,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     }
 
     // Full path: convert input from normalized RGB to IPT
+    if (SH_PARAMS(sh).cb1_stable_pq) {
+        GLSL("vec3 lms = "$" * color.rgb;\n"
+             "vec3 lmspq = %f * lms;\n", SH_MAT3(rgb2lms), PL_COLOR_SDR_WHITE / 10000);
+        cb1_pq_oetf(sh, "lmspq");
+        GLSL("vec3 ipt = "$" * lmspq;\nfloat i_orig = ipt.x;\n", lms2ipt);
+    } else {
     GLSL("vec3 lms = "$" * color.rgb;               \n"
          "vec3 lmspq = %f * lms;                    \n"
          "lmspq = pow(max(lmspq, 0.0), vec3(%f));   \n"
@@ -1887,6 +2182,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          PL_COLOR_SDR_WHITE / 10000,
          PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2,
          lms2ipt);
+    }
 
     if (params->show_clipping) {
         const float eps = 1e-6f;
@@ -1937,9 +2233,17 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         } else {
 
             pl_assert(obj);
+            pl_fmt tone_fmt = params->cb1_fp32_tone_lut ?
+                pl_find_fmt(SH_GPU(sh), PL_FMT_FLOAT, 1, 32, 32,
+                            PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR) : NULL;
+            if (params->cb1_fp32_tone_lut && !tone_fmt) {
+                SH_FAIL(sh, "CB policy requires FP32 linear tone-LUT storage!");
+                return;
+            }
             ident_t lut = sh_lut(sh, sh_lut_params(
                 .object     = &obj->tone.lut,
                 .var_type   = PL_VAR_FLOAT,
+                .fmt        = tone_fmt,
                 .lut_type   = SH_LUT_AUTO,
                 .method     = SH_LUT_LINEAR,
                 .width      = tone.lut_size,
@@ -2018,6 +2322,42 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
              "ipt.yz *= min(i_orig / ipt.x, hull.y / hull.x);   \n");
     }
 
+    if (cb1_neutral_cm29 && need_tone_map) {
+        const ident_t bt2020_lms2rgb = SH_MAT3(pl_ipt_lms2rgb(
+            pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020)));
+        GLSL("vec3 cb1_check_pq = "$" * ipt;                                   \n"
+             "vec3 cb1_check_lms = pow(max(cb1_check_pq, 0.0), vec3(1.0/%f)); \n"
+             "cb1_check_lms = max(cb1_check_lms - vec3(%f), 0.0)              \n"
+             "    / (vec3(%f) - %f * cb1_check_lms);                           \n"
+             "cb1_check_lms = pow(cb1_check_lms, vec3(1.0/%f)) * %f;           \n"
+             "vec3 cb1_check_rgb = "$" * cb1_check_lms;                       \n"
+             "bool cb1_check_no_nan = all(equal(cb1_check_rgb, cb1_check_rgb)); \n",
+             ipt2lms,
+             PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1, 10000 / PL_COLOR_SDR_WHITE,
+             bt2020_lms2rgb);
+        if (cb1_direct_rgb_output) {
+            GLSL("if (cb1_check_no_nan) {                                      \n"
+                 "    color.rgb = clamp(cb1_check_rgb, 0.0, %f);               \n"
+                 "} else {                                                     \n",
+                 params->cb1_neutral_cm29_peak / PL_COLOR_SDR_WHITE);
+        } else {
+            GLSL("if (cb1_check_no_nan && (any(lessThan(cb1_check_rgb, vec3(0.0))) ||\n"
+                 "    any(greaterThan(cb1_check_rgb, vec3(%f))))) {            \n"
+                 "    cb1_check_rgb = clamp(cb1_check_rgb, 0.0, %f);           \n"
+                 "    vec3 cb1_clip_lms = "$" * cb1_check_rgb;                \n"
+                 "    cb1_clip_lms = pow(max(cb1_clip_lms * %f, 0.0), vec3(%f));\n"
+                 "    cb1_clip_lms = (vec3(%f) + %f * cb1_clip_lms)            \n"
+                 "        / (vec3(1.0) + %f * cb1_clip_lms);                    \n"
+                 "    cb1_clip_lms = pow(cb1_clip_lms, vec3(%f));              \n"
+                 "    ipt = "$" * cb1_clip_lms;                               \n"
+                 "}                                                            \n",
+                 params->cb1_neutral_cm29_peak / PL_COLOR_SDR_WHITE,
+                 params->cb1_neutral_cm29_peak / PL_COLOR_SDR_WHITE,
+                 SH_MAT3(rgb2lms), PL_COLOR_SDR_WHITE / 10000, PQ_M1,
+                 PQ_C1, PQ_C2, PQ_C3, PQ_M2, lms2ipt);
+        }
+    }
+
     if (need_gamut_map) {
         const struct pl_gamut_map_function *fun = gamut.function;
         sh_describef(sh, "gamut map (%s)", fun->name);
@@ -2068,6 +2408,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     }
 
     // Convert IPT back to linear RGB
+    if (SH_PARAMS(sh).cb1_stable_pq) {
+        GLSL("lmspq = "$" * ipt;\nlms = lmspq;\n", ipt2lms);
+        cb1_pq_eotf(sh, "lms");
+        GLSL("lms *= %f;\ncolor.rgb = "$" * lms;\n", 10000 / PL_COLOR_SDR_WHITE, SH_MAT3(lms2rgb));
+    } else {
     GLSL("lmspq = "$" * ipt;                        \n"
          "lms = pow(max(lmspq, 0.0), vec3(1.0/%f)); \n"
          "lms = max(lms - vec3(%f), 0.0)            \n"
@@ -2079,6 +2424,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
          10000 / PL_COLOR_SDR_WHITE,
          SH_MAT3(lms2rgb));
+    }
+
+    if (cb1_direct_rgb_output && need_tone_map)
+        GLSL("}\n");
 
     if (params->show_clipping) {
         GLSL("if (clip_hi) {                                                \n"

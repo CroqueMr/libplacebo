@@ -1,5 +1,6 @@
 shader_sources = [
   'colorspace.c',
+  'dovi_reference.c',
   'custom.c',
   'custom_mpv.c',
   'deinterlacing.c',

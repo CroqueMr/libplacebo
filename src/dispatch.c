@@ -15,6 +15,7 @@
  * License along with libplacebo. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <math.h>
 #include "common.h"
 #include "log.h"
 #include "shaders.h"
@@ -29,6 +30,8 @@
 
 enum {
     TMP_PRELUDE,   // GLSL version, global definitions, etc.
+    TMP_CUSTOM_PRELUDE, // custom extension directives, before declarations
+    TMP_PRELUDE_TAIL, // precision and declarations, after the extensions
     TMP_MAIN,      // main GLSL shader body
     TMP_VERT_HEAD, // vertex shader inputs/outputs
     TMP_VERT_BODY, // vertex shader body
@@ -42,6 +45,7 @@ struct pl_dispatch_t {
     uint8_t current_ident;
     uint8_t current_index;
     bool dynamic_constants;
+    bool cb1_stable_pq;
     int max_passes;
 
     void (*info_callback)(void *, const struct pl_dispatch_info *);
@@ -148,6 +152,7 @@ pl_shader pl_dispatch_begin_ex(pl_dispatch dp, bool unique)
         .gpu = dp->gpu,
         .index = dp->current_index,
         .dynamic_constants = dp->dynamic_constants,
+        .cb1_stable_pq = dp->cb1_stable_pq,
     };
 
     pl_shader sh = NULL;
@@ -165,6 +170,11 @@ pl_shader pl_dispatch_begin_ex(pl_dispatch dp, bool unique)
 void pl_dispatch_mark_dynamic(pl_dispatch dp, bool dynamic)
 {
     dp->dynamic_constants = dynamic;
+}
+
+void pl_dispatch_mark_cb1_stable_pq(pl_dispatch dp, bool enabled)
+{
+    dp->cb1_stable_pq = enabled;
 }
 
 void pl_dispatch_callback(pl_dispatch dp, void *priv,
@@ -301,6 +311,12 @@ static void generate_shaders(pl_dispatch dp,
     void *tmp = params->tmp;
     struct pass *pass = params->pass;
     struct pl_pass_params *pass_params = params->pass_params;
+    // Custom shader preludes can contain #extension directives. GLSL ES
+    // requires these before precision, uniform and interface declarations.
+    // Detach them before finalization concatenates the function body.
+    pl_str_builder custom_pre = dp->tmp[TMP_CUSTOM_PRELUDE];
+    pl_str_builder_concat(custom_pre, sh->buffers[SH_BUF_PRELUDE]);
+    pl_str_builder_reset(sh->buffers[SH_BUF_PRELUDE]);
     pl_str_builder shader_body = sh_finalize_internal(sh);
 
     pl_str_builder pre = dp->tmp[TMP_PRELUDE];
@@ -308,18 +324,6 @@ static void generate_shaders(pl_dispatch dp,
         (gpu->glsl.gles && gpu->glsl.version > 100) ? " es" : "");
     if (pass_params->type == PL_PASS_COMPUTE)
         ADD(pre, "#extension GL_ARB_compute_shader : enable\n");
-
-    // Enable this unconditionally if the GPU supports it, since we have no way
-    // of knowing whether subgroups are being used or not
-    if (gpu->glsl.subgroup_size) {
-        ADD(pre, "#extension GL_KHR_shader_subgroup_basic : enable \n"
-                 "#extension GL_KHR_shader_subgroup_vote : enable \n"
-                 "#extension GL_KHR_shader_subgroup_arithmetic : enable \n"
-                 "#extension GL_KHR_shader_subgroup_ballot : enable \n"
-                 "#extension GL_KHR_shader_subgroup_shuffle : enable \n"
-                 "#extension GL_KHR_shader_subgroup_clustered : enable \n"
-                 "#extension GL_KHR_shader_subgroup_quad : enable \n");
-    }
 
     // Enable all extensions needed for different types of input
     bool has_ssbo = false, has_ubo = false, has_img = false, has_texel = false,
@@ -378,6 +382,9 @@ static void generate_shaders(pl_dispatch dp,
         ADD(pre, "#extension GL_EXT_shader_image_load_formatted : enable\n");
     if (has_gather && !gpu->glsl.gles)
         ADD(pre, "#extension GL_ARB_texture_gather : enable\n");
+
+    pl_str_builder head = pre;
+    pre = dp->tmp[TMP_PRELUDE_TAIL];
 
     if (gpu->glsl.gles) {
         // Use 32-bit precision for floats if possible
@@ -489,7 +496,8 @@ static void generate_shaders(pl_dispatch dp,
             if (gpu->glsl.vulkan) {
                 ADD(pre, "layout(binding=%d) uniform %c%s "$";\n",
                     desc->binding, prefix, type, id);
-            } else if (gpu->glsl.gles && prefix != ' ') {
+            } else if (gpu->glsl.gles &&
+                       (prefix != ' ' || tex->params.format->component_depth[0] > 8)) {
                 ADD(pre, "uniform highp %c%s "$";\n", prefix, type, id);
             } else {
                 ADD(pre, "uniform %c%s "$";\n", prefix, type, id);
@@ -602,6 +610,19 @@ static void generate_shaders(pl_dispatch dp,
     }
 
     pl_str_builder glsl = dp->tmp[TMP_MAIN];
+    ADD_CAT(glsl, head);
+    // Enable this unconditionally if the GPU supports it, since we have no way
+    // of knowing whether subgroups are being used or not
+    if (gpu->glsl.subgroup_size) {
+        ADD(glsl, "#extension GL_KHR_shader_subgroup_basic : enable \n"
+                  "#extension GL_KHR_shader_subgroup_vote : enable \n"
+                  "#extension GL_KHR_shader_subgroup_arithmetic : enable \n"
+                  "#extension GL_KHR_shader_subgroup_ballot : enable \n"
+                  "#extension GL_KHR_shader_subgroup_shuffle : enable \n"
+                  "#extension GL_KHR_shader_subgroup_clustered : enable \n"
+                  "#extension GL_KHR_shader_subgroup_quad : enable \n");
+    }
+    ADD_CAT(glsl, custom_pre);
     ADD_CAT(glsl, pre);
 
     switch(pass_params->type) {
@@ -614,6 +635,7 @@ static void generate_shaders(pl_dispatch dp,
         bool has_loc = gpu->glsl.version >= 430;
 
         // Set up a trivial vertex shader
+        ADD_CAT(vert_head, head);
         ADD_CAT(vert_head, pre);
         ADD(vert_body, "void main() {\n");
         for (int i = 0; i < sh->vas.num; i++) {
@@ -1332,14 +1354,43 @@ bool pl_dispatch_finish(pl_dispatch dp, const struct pl_dispatch_params *params)
     if (rparams->vertex_data) {
         uintptr_t vert_base = (uintptr_t) rparams->vertex_data;
         size_t stride = rparams->pass->params.vertex_stride;
+        bool triangle = true;
+        for (int i = 0; i < sh->vas.num; i++) {
+            const struct pl_shader_va *sva = &sh->vas.elem[i];
+            const pl_fmt fmt = sva->attr.fmt;
+            triangle &= fmt->type == PL_FMT_FLOAT &&
+                        fmt->texel_size == 4 * fmt->num_components;
+            if (!triangle)
+                break;
+            const float *a = sva->data[0], *b = sva->data[1];
+            const float *c = sva->data[2], *d = sva->data[3];
+            for (int n = 0; n < fmt->num_components; n++) {
+                // Only affine attributes may be extended to one triangle.
+                // Preserve the original quad for arbitrary corner data.
+                triangle &= fmt->component_depth[n] == 32 &&
+                            isfinite(a[n]) && isfinite(b[n]) &&
+                            isfinite(c[n]) && isfinite(d[n]) &&
+                            d[n] == b[n] + c[n] - a[n];
+            }
+        }
+        rparams->vertex_count = triangle ? 3 : 4;
         for (int i = 0; i < sh->vas.num; i++) {
             const struct pl_shader_va *sva = &sh->vas.elem[i];
             struct pl_vertex_attrib *va = &rparams->pass->params.vertex_attribs[i];
 
             size_t size = sva->attr.fmt->texel_size;
             uintptr_t va_base = vert_base + va->offset; // use placed offset
-            for (int n = 0; n < 4; n++)
-                memcpy((void *) (va_base + n * stride), sva->data[n], size);
+            for (int n = 0; n < rparams->vertex_count; n++) {
+                void *dest = (void *) (va_base + n * stride);
+                memcpy(dest, sva->data[n], size);
+                if (triangle && n) {
+                    float *out = dest;
+                    const float *origin = sva->data[0];
+                    const float *edge = sva->data[n];
+                    for (int c = 0; c < sva->attr.fmt->num_components; c++)
+                        out[c] = 2.0f * edge[c] - origin[c];
+                }
+            }
         }
     }
 

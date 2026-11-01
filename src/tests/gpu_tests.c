@@ -859,6 +859,43 @@ static void pl_shader_tests(pl_gpu gpu)
         .target = fbo,
     }));
 
+    // Test the opt-in linear Dolby Vision decoder domain in generated GLSL.
+    {
+        struct pl_color_repr pq_repr = {
+            .sys = PL_COLOR_SYSTEM_DOLBYVISION,
+            .dovi = &dovi_meta,
+        };
+        sh = pl_dispatch_begin(dp);
+        pl_shader_sample_direct(sh, pl_sample_src( .tex = src ));
+        pl_shader_decode_color_ex(sh, pl_color_decode_args( .repr = &pq_repr ));
+        const struct pl_shader_res *pq = pl_shader_finalize(sh);
+        REQUIRE(pq && pq->glsl);
+        REQUIRE(strstr(pq->glsl, "pow(max(color.rgb, 0.0), vec3(0.159302"));
+        pl_dispatch_abort(dp, &sh);
+
+        struct pl_color_repr linear_repr = {
+            .sys = PL_COLOR_SYSTEM_DOLBYVISION,
+            .dovi = &dovi_meta,
+        };
+        sh = pl_dispatch_begin(dp);
+        pl_shader_sample_direct(sh, pl_sample_src( .tex = src ));
+        pl_shader_decode_color_ex(sh, pl_color_decode_args(
+            .repr = &linear_repr,
+            .cb1_dovi_linear = true,
+        ));
+        const struct pl_shader_res *linear = pl_shader_finalize(sh);
+        REQUIRE(linear && linear->glsl);
+        REQUIRE(strstr(linear->glsl, "color.rgb = max(color.rgb, 0.0) * vec3("));
+        REQUIRE(strstr(linear->glsl, "49.261"));
+        REQUIRE(!strstr(linear->glsl, "pow(max(color.rgb, 0.0), vec3(0.159302"));
+        REQUIRE(strstr(linear->glsl, "78.84375"));
+        bool has_lms_matrix = false;
+        for (int i = 0; i < linear->num_variables; i++)
+            has_lms_matrix |= !strcmp(linear->variables[i].var.name, "lms2rgb");
+        REQUIRE(has_lms_matrix);
+        pl_dispatch_abort(dp, &sh);
+    }
+
     // Test dolbyvision
     struct pl_color_repr repr = {
         .sys = PL_COLOR_SYSTEM_DOLBYVISION,

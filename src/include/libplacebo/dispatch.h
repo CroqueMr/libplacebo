@@ -42,6 +42,10 @@ PL_API void pl_dispatch_destroy(pl_dispatch *dp);
 // are the same.
 PL_API void pl_dispatch_reset_frame(pl_dispatch dp);
 
+// CB policy-only option for subsequent new/reset shaders. Default off.
+// The renderer sets this on every call, including false after an opted-in call.
+PL_API void pl_dispatch_mark_cb1_stable_pq(pl_dispatch dp, bool enabled);
+
 // Returns a blank pl_shader object, suitable for recording rendering commands.
 // For more information, see the header documentation in `shaders/*.h`.
 PL_API pl_shader pl_dispatch_begin(pl_dispatch dp);
