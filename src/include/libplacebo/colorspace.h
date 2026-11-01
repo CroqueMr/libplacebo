@@ -128,6 +128,30 @@ struct pl_bit_encoding {
 PL_API bool pl_bit_encoding_equal(const struct pl_bit_encoding *b1,
                                   const struct pl_bit_encoding *b2);
 
+// CB1 raw fixed-point components. Shared layout; no decoder-owned pointers.
+struct pl_cb1_dovi_component {
+    uint8_t num_pivots, method[8], order[8];
+    uint16_t pivots[9];
+    int64_t poly[8][3], constant[8], mmr[8][3][7];
+};
+
+#define PL_HAVE_CB1_MASTER_REFERENCE 1
+struct pl_cb1_dovi_reference {
+    // 1: original layout; 2: exact paired-row intermediate.
+    uint32_t contract;
+    uint8_t bl_depth, el_depth, output_depth, denom;
+    bool residual;
+    struct pl_cb1_dovi_component comp[3];
+    struct {
+        uint16_t offset;
+        uint64_t slope, threshold, maximum;
+    } nlq[3];
+};
+#define PL_CB1_DOVI_REFERENCE_ABI ((PL_HAVE_CB1_MASTER_REFERENCE << 16) | (unsigned)sizeof(struct pl_cb1_dovi_reference))
+PL_API unsigned pl_cb1_dovi_reference_abi(void);
+// Optional contract 2 capability; contract 1 remains supported.
+PL_API unsigned pl_cb1_dovi_reference_paired_rows_abi(void);
+
 // Parsed metadata from the Dolby Vision RPU
 struct pl_dovi_metadata {
     // Colorspace transformation metadata
@@ -164,6 +188,10 @@ struct pl_dovi_metadata {
         float deadzone_slope;     // (2^el_bit_depth - 1) * S / 2^coef_log2_denom
         float deadzone_threshold; // (T - S/2) / 2^coef_log2_denom
     } nlq[3];
+    // CB1 native reconstruction bounds; default off preserves other callers.
+#define PL_HAVE_CB1_NATIVE_BOUNDS 1
+    bool cb1_native_bounds;
+    float cb1_nlq_max[3];
 };
 
 // Struct describing the underlying color system and representation. This

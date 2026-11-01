@@ -340,6 +340,48 @@ struct pl_render_params {
     // disabling linear scaling and sigmoidization.
     bool force_low_bit_depth_fbos;
 
+    // Minimum component precision for intermediate textures (0: default).
+    // A value of 32 requires floating-point intermediates without a lower-depth fallback.
+    int min_fbo_precision;
+
+    // CB policy opt-in: aligned, exact 1:1 plane/main sampling uses the
+    // existing nearest sampler instead of automatic bilinear sampling.
+    // Default false preserves all existing callers. Requires matching
+    // CB-patched headers and library; this is not an upstream ABI field.
+    bool cb1_nearest_identity;
+    // CB policy-only equivalent ST2084 FP32 realization, default off.
+    // Requires matched renderer/shader/dispatch headers and library.
+    bool cb1_stable_pq;
+    // CB policy-only orthogonal scaler-LUT FP32 storage, default off.
+    // Weights and sampling stay unchanged. Requires matched sampling ABI.
+    bool cb1_fp32_scaler_lut;
+    // CB policy opt-in: colour management consumes the current hook domain.
+    // Default false retains original source-domain handling. Matched ABI only.
+    bool cb1_hook_color_space;
+    // Exact 2x centered taps; caller validates fragment quad support.
+    bool cb1_quad_scaler;
+    // CB native transport opt-in. Reconstruct opponent components instead of
+    // RGB; a caller-provided output hook packs them with matching DM matrices.
+    // Requires 1:1 geometry, no color operations/overlays and matched headers.
+    bool cb1_dovi_transport;
+    // CB1 opt-in: return DOVI decode in 203-nit-relative linear RGB.
+    // Default false; requires neutral inputs, before any linear scaling.
+    bool cb1_dovi_linear;
+    // Exact native transport sampler cache, default off. Validated GPU only.
+    bool cb1_exact_scaler_cache;
+    // CB1 opt-in: bilinear input chroma enlargement; luma and RGB stay unchanged.
+    // Default off. Requires matched renderer headers and library.
+#define PL_CB1_CHROMA_FILTER_API 1
+    bool cb1_fast_chroma;
+    // Explicit nearest sampling of the reconstruction EL only; default false.
+#define PL_CB1_FEL_FILTER_API 1
+    bool cb1_fel_nearest;
+    // Borrowed opt-in CB1 processing contract. Requires a matched library.
+    const struct pl_cb1_dovi_processing *cb1_processing;
+    // Per-picture integer reference. Null preserves existing composition.
+    const struct pl_cb1_dovi_reference *cb1_dovi_reference;
+
+
     // If this is true, all shaders will be generated as "dynamic" shaders,
     // with any compile-time constants being replaced by runtime-adjustable
     // values. This is generally a performance loss, but has the advantage of
@@ -379,6 +421,8 @@ struct pl_render_params {
 
 #define pl_render_params(...) (&(struct pl_render_params) { PL_RENDER_DEFAULTS __VA_ARGS__ })
 PL_API extern const struct pl_render_params pl_render_fast_params;
+
+PL_API unsigned pl_cb1_fel_filter_abi(void);
 
 // This contains the default/recommended options for reasonable image quality,
 // while also not being too terribly slow. All of the *_params structs are
@@ -715,6 +759,9 @@ PL_API void pl_frames_infer(pl_renderer rr, struct pl_frame *image,
                             struct pl_frame *target);
 
 
+// Matched private CB1 input-chroma renderer ABI.
+PL_API unsigned pl_cb1_chroma_filter_abi(void);
+
 // Render a single image to a target using the given parameters. This is
 // fully dynamic, i.e. the params can change at any time. libplacebo will
 // internally detect and flush whatever caches are invalidated as a result of
@@ -738,6 +785,14 @@ PL_API void pl_frames_infer(pl_renderer rr, struct pl_frame *image,
 PL_API bool pl_render_image(pl_renderer rr, const struct pl_frame *image,
                             const struct pl_frame *target,
                             const struct pl_render_params *params);
+
+// CB1 full-raster 4K transport only. The output hook must replace all rows
+// outside [active_y0, active_y1), including any subtitle/background composition.
+// Intermediate separable plane scalers may omit those rows. Active filtering
+// and the ordinary pl_render_image path are unchanged.
+PL_API bool pl_render_image_cb1_active_rows(pl_renderer rr, const struct pl_frame *image,
+                            const struct pl_frame *target,
+                            const struct pl_render_params *params, int active_y0, int active_y1);
 
 // Flushes the internal state of this renderer. This is normally not needed,
 // even if the image parameters, colorspace or target configuration change,

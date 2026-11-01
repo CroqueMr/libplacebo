@@ -67,6 +67,7 @@ struct pl_renderer_t {
     // Shader resource objects and intermediate textures (FBOs)
     pl_shader_obj tone_map_state;
     pl_shader_obj dither_state;
+    pl_shader_obj cb1_mmr_state;
     pl_shader_obj grain_state[4];
     pl_shader_obj lut_state[3];
     pl_shader_obj icc_state[2];
@@ -159,6 +160,7 @@ void pl_renderer_destroy(pl_renderer *p_rr)
     // Free all shader resource objects
     pl_shader_obj_destroy(&rr->tone_map_state);
     pl_shader_obj_destroy(&rr->dither_state);
+    pl_shader_obj_destroy(&rr->cb1_mmr_state);
     for (int i = 0; i < PL_ARRAY_SIZE(rr->lut_state); i++)
         pl_shader_obj_destroy(&rr->lut_state[i]);
     for (int i = 0; i < PL_ARRAY_SIZE(rr->grain_state); i++)
@@ -343,6 +345,7 @@ struct pass_state {
     pl_renderer rr;
     const struct pl_render_params *params;
     struct pl_render_info info; // for info callback
+    float cb1_active_rows[2];
 
     // Represents the "current" image which we're in the process of rendering.
     // This is initially set by pass_read_image, and all of the subsequent
@@ -415,10 +418,13 @@ static void find_fbo_format(struct pass_state *pass)
 
     pl_fmt fmt = NULL;
     for (int i = 0; i < PL_ARRAY_SIZE(configs); i++) {
+        if (params->min_fbo_precision > 16 && configs[i].type != PL_FMT_FLOAT)
+            continue;
+        int depth = PL_MAX(configs[i].depth, params->min_fbo_precision);
         if (params->force_low_bit_depth_fbos && configs[i].depth > 8)
             continue;
 
-        fmt = pl_find_fmt(rr->gpu, configs[i].type, 4, configs[i].depth, 0,
+        fmt = pl_find_fmt(rr->gpu, configs[i].type, 4, depth, 0,
                           PL_FMT_CAP_RENDERABLE | configs[i].caps);
         if (!fmt)
             continue;
@@ -429,7 +435,7 @@ static void find_fbo_format(struct pass_state *pass)
         // back to the next biggest format
         for (int c = 3; c >= 1; c--) {
             pass->fbofmt[c] = pl_find_fmt(rr->gpu, configs[i].type, c,
-                                        configs[i].depth, 0, fmt->caps);
+                                        depth, 0, fmt->caps);
             pass->fbofmt[c] = PL_DEF(pass->fbofmt[c], pass->fbofmt[c+1]);
         }
         return;
@@ -589,6 +595,7 @@ enum sampler_dir {
 enum sampler_usage {
     SAMPLER_MAIN,
     SAMPLER_PLANE,
+    SAMPLER_CHROMA,
     SAMPLER_LOWPASS,
 };
 
@@ -606,6 +613,7 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
 {
     const struct pl_render_params *params = pass->params;
     struct sampler_info info = { .usage = usage };
+    bool plane = usage == SAMPLER_PLANE || usage == SAMPLER_CHROMA;
     pl_renderer rr = pass->rr;
 
     float rx = src->new_w / fabsf(pl_rect_w(src->rect));
@@ -635,14 +643,16 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
     case SAMPLER_DOWN:
         if (usage == SAMPLER_LOWPASS) {
             info.config = &pl_filter_bicubic;
-        } else if (usage == SAMPLER_PLANE && params->plane_downscaler) {
+        } else if (plane && params->plane_downscaler) {
             info.config = params->plane_downscaler;
         } else {
             info.config = params->downscaler;
         }
         break;
     case SAMPLER_UP:
-        if (usage == SAMPLER_PLANE && params->plane_upscaler) {
+        if (usage == SAMPLER_CHROMA && params->cb1_fast_chroma) {
+            info.config = &pl_filter_bilinear;
+        } else if (plane && params->plane_upscaler) {
             info.config = params->plane_upscaler;
         } else {
             pl_assert(usage != SAMPLER_LOWPASS);
@@ -687,11 +697,36 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
     return info;
 }
 
+static bool skip_inactive_rows(struct pass_state *pass, pl_shader sh, int height, bool target_coordinates)
+{
+    if (height != 2160 || pass->cb1_active_rows[1] <= pass->cb1_active_rows[0])
+        return true;
+    enum pl_shader_sig signature = sh->output;
+    if (!sh_require(sh, signature, 0, 0))
+        return false;
+    sh->output = signature;
+    float bounds[2] = {pass->cb1_active_rows[0], pass->cb1_active_rows[1]};
+    if (target_coordinates && pass->target.planes[0].flipped) {
+        bounds[0] = 2160-pass->cb1_active_rows[1];
+        bounds[1] = 2160-pass->cb1_active_rows[0];
+    }
+    ident_t rows = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_vec2("cb1_active_rows"),
+        .data = bounds, .dynamic = true,
+    });
+    GLSL("if(gl_FragCoord.y < "$".x || gl_FragCoord.y >= "$".y) "
+         "return vec4(0.0,0.0,0.0,1.0);\n", rows, rows);
+    return true;
+}
+
 static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
                              struct sampler *sampler, enum sampler_usage usage,
                              pl_tex target_tex, const struct pl_sample_src *src)
 {
     const struct pl_render_params *params = pass->params;
+    bool plane = usage == SAMPLER_PLANE || usage == SAMPLER_CHROMA;
+    if (plane && !skip_inactive_rows(pass, sh, src->new_h, true))
+        return;
     if (!sampler)
         goto fallback;
 
@@ -700,6 +735,17 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
     pl_shader_obj *lut = NULL;
     switch (info.dir) {
     case SAMPLER_NOOP:
+        if (params->cb1_nearest_identity &&
+            src->new_w == fabsf(pl_rect_w(src->rect)) &&
+            src->new_h == fabsf(pl_rect_h(src->rect)) &&
+            src->rect.x0 == floorf(src->rect.x0) &&
+            src->rect.y0 == floorf(src->rect.y0) &&
+            src->rect.x1 == floorf(src->rect.x1) &&
+            src->rect.y1 == floorf(src->rect.y1))
+        {
+            pl_shader_sample_nearest(sh, src);
+            return;
+        }
         goto fallback;
     case SAMPLER_DOWN:
         lut = &sampler->downscaler_state;
@@ -733,9 +779,13 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
 
     pl_assert(lut);
     struct pl_sample_filter_params fparams = {
+        .cb1_quad_scaler = params->cb1_quad_scaler,
         .filter      = *info.config,
         .antiring    = params->antiringing_strength,
         .no_widening = params->skip_anti_aliasing && usage != SAMPLER_LOWPASS,
+        .cb1_fp32_lut = params->cb1_fp32_scaler_lut,
+        .cb1_exact_lut_cache = (params->cb1_dovi_transport && params->cb1_exact_scaler_cache) ||
+            (params->cb1_processing && (params->cb1_processing->groups & 4)),
         .lut         = lut,
     };
 
@@ -759,6 +809,11 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
         src2.rect.y1 = src1.new_h;
 
         pl_shader tsh = pl_dispatch_begin(rr->dp);
+        if (plane && !skip_inactive_rows(pass, tsh, src1.new_h, false)) {
+            pl_dispatch_abort(rr->dp, &tsh);
+            ok = false;
+            goto done;
+        }
         ok = pl_shader_sample_ortho2(tsh, &src1, &fparams);
         if (!ok) {
             pl_dispatch_abort(rr->dp, &tsh);
@@ -1539,7 +1594,8 @@ static bool want_merge(struct pass_state *pass,
         },
     };
 
-    struct sampler_info info = sample_src_info(pass, &src, SAMPLER_PLANE);
+    enum sampler_usage usage = st->type == PLANE_CHROMA ? SAMPLER_CHROMA : SAMPLER_PLANE;
+    struct sampler_info info = sample_src_info(pass, &src, usage);
     if (info.type == SAMPLER_COMPLEX)
         return true;
 
@@ -1651,8 +1707,19 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
                  src.rect.x0, src.rect.y0, src.rect.x1, src.rect.y1);
 
         pl_shader plane_sh = pl_dispatch_begin_ex(rr->dp, true);
-        dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], SAMPLER_PLANE,
-                         NULL, &src);
+        enum sampler_usage usage = detect_plane_type(plane, &el->repr) == PLANE_CHROMA ?
+                                   SAMPLER_CHROMA : SAMPLER_PLANE;
+        if (pass->params->cb1_fel_nearest) {
+            if (plane->flipped) {
+                src.rect.y0 = plane->texture->params.h - src.rect.y0;
+                src.rect.y1 = plane->texture->params.h - src.rect.y1;
+            }
+            if (usage != SAMPLER_PLANE || skip_inactive_rows(pass, plane_sh, src.new_h, true))
+                pl_shader_sample_nearest(plane_sh, &src);
+        } else {
+            dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], usage,
+                             NULL, &src);
+        }
 
         ident_t sub = sh_subpass(sh, plane_sh);
         pl_dispatch_abort(rr->dp, &plane_sh);
@@ -1675,9 +1742,139 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
 }
 #endif // PL_HAVE_DOVI
 
+unsigned pl_cb1_fel_filter_abi(void)
+{
+    return PL_CB1_FEL_FILTER_API;
+}
+
+static bool skip_reference_chroma_rows(struct pass_state *pass, pl_shader sh)
+{
+    if (pass->cb1_active_rows[1]<=pass->cb1_active_rows[0]) return true;
+    float bounds[2]={floorf(pass->cb1_active_rows[0]/2)-4,
+                     ceilf(pass->cb1_active_rows[1]/2)+4};
+    enum pl_shader_sig signature=sh->output;
+    if (!sh_require(sh,signature,0,0)) return false;
+    sh->output=signature;
+    ident_t rows=sh_var(sh,(struct pl_shader_var){.var=pl_var_vec2("ref_active_rows"),
+                                               .data=bounds,.dynamic=true});
+    GLSL("if(gl_FragCoord.y < "$".x || gl_FragCoord.y >= "$".y) return vec4(0.0);\n",rows,rows);
+    return true;
+}
+
+static bool pass_read_dovi_reference(struct pass_state *pass)
+{
+    const struct pl_cb1_dovi_reference *data=pass->params->cb1_dovi_reference;
+    const struct pl_frame *image=&pass->image;
+    int w=image->crop.x1,h=image->crop.y1;
+    if (!pass->params->cb1_dovi_transport || image->icc || image->lut ||
+        pass->params->lut || pass->rotation || pl_rect_w(pass->target.crop)!=w ||
+        pl_rect_h(pass->target.crop)!=h || w<=0 || h<=0) return false;
+    pl_tex planes[2]={0};
+    if(pass->params->cb1_fast_chroma){
+        pl_fmt fmt=pl_find_fmt(pass->rr->gpu,PL_FMT_UNORM,2,16,16,
+                              PL_FMT_CAP_RENDERABLE|PL_FMT_CAP_SAMPLEABLE|PL_FMT_CAP_LINEAR);
+        pl_tex chroma=fmt?get_fbo(pass,w/2,h/2,fmt,2,PL_DEBUG_TAG):NULL;
+        pl_shader sh=pl_dispatch_begin(pass->rr->dp);
+        bool ok=chroma && skip_reference_chroma_rows(pass,sh) &&
+            sh_dovi_p5_fast_grid(sh,data,image,true) &&
+            pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=chroma));
+        pl_dispatch_abort(pass->rr->dp,&sh);
+        if(!ok)return false;
+        pl_shader luma=pl_dispatch_begin_ex(pass->rr->dp,true);
+        sh=pl_dispatch_begin_ex(pass->rr->dp,true);
+        ok=skip_inactive_rows(pass,luma,h,true) && sh_dovi_p5_fast_grid(luma,data,image,false) &&
+            sh_dovi_p5_fast_output(sh,luma,chroma,w,h);
+        pl_dispatch_abort(pass->rr->dp,&luma);
+        if(!ok){pl_dispatch_abort(pass->rr->dp,&sh);return false;}
+        pass->img=(struct img){.sh=sh,.w=w,.h=h,.comps=3,.repr=pl_color_repr_rgb,
+            .color=image->color,.rect={0,0,w,h}};
+        pass->ref_rect=pass->img.rect;
+        pass_hook(pass,&pass->img,PL_HOOK_NATIVE);
+        return true;
+    }
+    if(pass->rr->gpu->glsl.subgroup_size && sh_dovi_reference_identity(data) &&
+       fmodf(pass->target.crop.y0,2.0f)==0.0f){
+        bool top_left=false;
+        for(int p=0;p<image->num_planes;p++)
+            if(image->planes[p].component_mapping[0]==1)top_left=image->planes[p].shift_y==-.5f;
+        pl_shader sh=pl_dispatch_begin_ex(pass->rr->dp,true);
+        /* Inactive rows must still reach the carrier output hook. */
+        bool ok=sh_dovi_reference_identity_output(sh,data,image,top_left);
+        if(!ok){pl_dispatch_abort(pass->rr->dp,&sh);return false;}
+        pass->img=(struct img){.sh=sh,.w=w,.h=h,.comps=3,.repr=pl_color_repr_rgb,
+            .color=image->color,.rect={0,0,w,h}};
+        pass->ref_rect=pass->img.rect;
+        pass_hook(pass,&pass->img,PL_HOOK_NATIVE);
+        return true;
+    }
+    pl_tex luma_el=NULL;
+    const struct pl_frame *el=image->enhancement_layer;
+    bool resize=data->residual && el && el->crop.x1*2==w && el->crop.y1*2==h;
+    for (int c=0;c<2;c++) {
+        pl_fmt fmt=pl_find_fmt(pass->rr->gpu,PL_FMT_FLOAT,c?2:1,32,32,
+                              PL_FMT_CAP_RENDERABLE|PL_FMT_CAP_SAMPLEABLE);
+        if (!fmt) return false;
+        pl_tex vertical=NULL;
+        if (resize) {
+            /* FP32 stores every rounded 16-bit intermediate exactly. */
+            vertical=get_fbo(pass,c?w/4:w/2,c?h/2:h,fmt,c?2:1,PL_DEBUG_TAG);
+            pl_shader sh=pl_dispatch_begin(pass->rr->dp);
+            bool rows=c?skip_reference_chroma_rows(pass,sh):skip_inactive_rows(pass,sh,h,false);
+            bool ok=vertical && rows && sh_dovi_reference_el_vertical(sh,data,image,c) &&
+                pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=vertical));
+            pl_dispatch_abort(pass->rr->dp,&sh);
+            if (!ok) return false;
+        }
+        if (!c) {
+            luma_el=vertical;
+            continue;
+        }
+        if(data->contract==2)fmt=pl_find_fmt(pass->rr->gpu,PL_FMT_FLOAT,1,32,32,
+                              PL_FMT_CAP_RENDERABLE|PL_FMT_CAP_SAMPLEABLE);
+        if(!fmt)return false;
+        planes[c]=get_fbo(pass,c?w/2:w,c?h/2:h,fmt,data->contract==2?1:c?2:1,PL_DEBUG_TAG);
+        pl_shader sh=pl_dispatch_begin(pass->rr->dp);
+        bool ok=planes[c] && skip_reference_chroma_rows(pass,sh) &&
+            sh_dovi_reference_grid(sh,data,image,c,vertical,&pass->rr->cb1_mmr_state) &&
+            pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=planes[c]));
+        pl_dispatch_abort(pass->rr->dp,&sh);
+        if (!ok) return false;
+    }
+    bool top_left=false;
+    for(int p=0;p<image->num_planes;p++)
+        if(image->planes[p].component_mapping[0]==1)top_left=image->planes[p].shift_y==-.5f;
+    const bool paired=data->contract==2;
+    pl_fmt fmt=pl_find_fmt(pass->rr->gpu,PL_FMT_FLOAT,2,32,32,
+                          PL_FMT_CAP_RENDERABLE|PL_FMT_CAP_SAMPLEABLE);
+    if (!fmt) return false;
+    pl_tex chroma=get_fbo(pass,w/2,paired?h/2:h,fmt,2,PL_DEBUG_TAG);
+    pl_shader sh=pl_dispatch_begin(pass->rr->dp);
+    bool ok=chroma && (paired?skip_reference_chroma_rows(pass,sh):skip_inactive_rows(pass,sh,h,false)) &&
+        sh_dovi_reference_chroma(sh,planes[1],data->output_depth,top_left,paired) &&
+        pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=chroma));
+    pl_dispatch_abort(pass->rr->dp,&sh);
+    if (!ok) return false;
+    pl_shader luma=pl_dispatch_begin_ex(pass->rr->dp,true);
+    sh=pl_dispatch_begin_ex(pass->rr->dp,true);
+    ok=skip_inactive_rows(pass,luma,h,true) && sh_dovi_reference_grid(luma,data,image,false,luma_el,NULL) &&
+        sh_dovi_reference_output(sh,luma,chroma,data->output_depth,w,h,paired);
+    pl_dispatch_abort(pass->rr->dp,&luma);
+    if (!ok) {
+        pl_dispatch_abort(pass->rr->dp,&sh);
+        return false;
+    }
+    pass->img=(struct img){.sh=sh,.w=w,.h=h,.comps=3,.repr=pl_color_repr_rgb,
+        .color=image->color,.rect={0,0,w,h}};
+    pass->ref_rect=pass->img.rect;
+    pass_hook(pass,&pass->img,PL_HOOK_NATIVE);
+    return true;
+}
+
 // This scales and merges all of the source images, and initializes pass->img.
 static bool pass_read_image(struct pass_state *pass)
 {
+    if (pass->params->cb1_dovi_reference)
+        return pass_read_dovi_reference(pass);
     const struct pl_render_params *params = pass->params;
     struct pl_frame *image = &pass->image;
     pl_renderer rr = pass->rr;
@@ -1988,7 +2185,8 @@ static bool pass_read_image(struct pass_state *pass)
             st->img.tex = NULL;
             st->img.sh = pl_dispatch_begin_ex(rr->dp, true);
             dispatch_sampler(pass, st->img.sh, &rr->samplers_src[i],
-                             SAMPLER_PLANE, NULL, &src);
+                             st->type == PLANE_CHROMA ? SAMPLER_CHROMA : SAMPLER_PLANE,
+                             NULL, &src);
             st->img.err_enum |= PL_RENDER_ERR_SAMPLING;
             st->img.rect.x0 = st->img.rect.y0 = 0.0f;
             st->img.w = st->img.rect.x1 = src.new_w;
@@ -2081,11 +2279,34 @@ static bool pass_read_image(struct pass_state *pass)
             }
         }
 #endif
-        pl_shader_decode_color_ex(sh, pl_color_decode_args(
-            .repr              = &pass->img.repr,
-            .color_adjustment  = params->color_adjustment,
-            .enhancement_layer = el_sh,
-        ));
+        if (params->cb1_dovi_transport) {
+            if (pass->img.repr.sys != PL_COLOR_SYSTEM_RGB)
+                pl_shader_dovi_reconstruct_ex(sh, &pass->img.repr, el_sh, params->cb1_processing);
+            // Internal carrier only. The output hook owns opponent encoding.
+            pass->img.repr.sys = PL_COLOR_SYSTEM_RGB;
+            pass->img.repr.levels = PL_COLOR_LEVELS_FULL;
+        } else {
+            const struct pl_color_adjustment *adj = params->color_adjustment;
+            bool neutral_adjustment = !adj ||
+                (adj->brightness == 0.0f && adj->contrast == 1.0f &&
+                 adj->saturation == 1.0f && adj->hue == 0.0f &&
+                 adj->gamma == 1.0f && adj->temperature == 0.0f);
+            bool dovi_linear = params->cb1_dovi_linear &&
+                image->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+                pass->img.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+                pass->rotation == PL_ROTATION_0 &&
+                !params->disable_linear_scaling &&
+                !image->icc && !image->lut && !params->lut && neutral_adjustment;
+            pl_shader_decode_color_ex(sh, pl_color_decode_args(
+                .repr              = &pass->img.repr,
+                .color_adjustment  = params->color_adjustment,
+                .enhancement_layer = el_sh,
+                .cb1_processing    = params->cb1_processing,
+                .cb1_dovi_linear   = dovi_linear,
+            ));
+            if (dovi_linear)
+                pass->img.color.transfer = PL_COLOR_TRC_LINEAR;
+        }
         pl_dispatch_abort(rr->dp, &el_sh);
     }
 
@@ -2304,6 +2525,8 @@ error:
 static void pass_convert_colors(struct pass_state *pass)
 {
     const struct pl_render_params *params = pass->params;
+    if (params->cb1_dovi_transport)
+        return;
     const struct pl_frame *image = &pass->image;
     const struct pl_frame *target = &pass->target;
     pl_renderer rr = pass->rr;
@@ -2313,20 +2536,23 @@ static void pass_convert_colors(struct pass_state *pass)
 
     bool prelinearized = false;
     bool need_conversion = true;
-    assert(image->color.primaries == img->color.primaries);
+    const struct pl_color_space src_csp = params->cb1_hook_color_space
+                                       ? img->color : image->color;
+    if (!params->cb1_hook_color_space)
+        assert(image->color.primaries == img->color.primaries);
     if (img->color.transfer == PL_COLOR_TRC_LINEAR) {
         if (img->repr.alpha == PL_ALPHA_PREMULTIPLIED) {
             // Very annoying edge case: since prelinerization happens with
             // premultiplied alpha, but color mapping happens with independent
             // alpha, we need to go back to non-linear representation *before*
             // alpha mode conversion, to avoid distortion
-            img->color.transfer = image->color.transfer;
+            img->color.transfer = src_csp.transfer;
             pl_shader_delinearize(sh, &img->color);
         } else {
             prelinearized = true;
         }
-    } else if (img->color.transfer != image->color.transfer) {
-        if (image->color.transfer == PL_COLOR_TRC_LINEAR) {
+    } else if (img->color.transfer != src_csp.transfer) {
+        if (src_csp.transfer == PL_COLOR_TRC_LINEAR) {
             // Another annoying edge case: if the input is linear light, but we
             // decide to un-linearize it for scaling purposes, we need to
             // re-linearize before passing it into `pl_shader_color_map`
@@ -2407,7 +2633,7 @@ static void pass_convert_colors(struct pass_state *pass)
 
         // current -> target
         pl_shader_color_map_ex(sh, params->color_map_params, pl_color_map_args(
-            .src           = image->color,
+            .src           = src_csp,
             .dst           = target_csp,
             .prelinearized = prelinearized,
             .state         = &rr->tone_map_state,
@@ -3623,12 +3849,13 @@ done:
     return true;
 }
 
-bool pl_render_image(pl_renderer rr, const struct pl_frame *pimage,
+static bool render_image(pl_renderer rr, const struct pl_frame *pimage,
                      const struct pl_frame *ptarget,
-                     const struct pl_render_params *params)
+                     const struct pl_render_params *params, int active_y0, int active_y1)
 {
     params = PL_DEF(params, &pl_render_default_params);
     pl_dispatch_mark_dynamic(rr->dp, params->dynamic_constants);
+    pl_dispatch_mark_cb1_stable_pq(rr->dp, params->cb1_stable_pq);
     if (!pimage)
         return draw_empty_overlays(rr, ptarget, params);
 
@@ -3638,6 +3865,7 @@ bool pl_render_image(pl_renderer rr, const struct pl_frame *pimage,
         .image = *pimage,
         .target = *ptarget,
         .info.stage = PL_RENDER_STAGE_FRAME,
+        .cb1_active_rows = {active_y0, active_y1},
     };
 
     if (!pass_init(&pass, true))
@@ -3665,6 +3893,32 @@ error:
     PL_ERR(rr, "Failed rendering image!");
     pass_uninit(&pass);
     return false;
+}
+
+unsigned pl_cb1_chroma_filter_abi(void)
+{
+    return PL_CB1_CHROMA_FILTER_API;
+}
+
+bool pl_render_image(pl_renderer rr, const struct pl_frame *image,
+                     const struct pl_frame *target, const struct pl_render_params *params)
+{
+    return render_image(rr, image, target, params, 0, 0);
+}
+
+bool pl_render_image_cb1_active_rows(pl_renderer rr, const struct pl_frame *image,
+                     const struct pl_frame *target, const struct pl_render_params *params,
+                     int active_y0, int active_y1)
+{
+    if (!image || !target || image->rotation || target->rotation ||
+        image->num_overlays || target->num_overlays ||
+        image->crop.x0 || image->crop.y0 || image->crop.x1 != 3840 || image->crop.y1 != 2160 ||
+        target->crop.x0 || target->crop.y0 || target->crop.x1 != 3840 || target->crop.y1 != 2160 ||
+        target->num_planes != 1 || !target->planes[0].texture ||
+        target->planes[0].texture->params.w != 3840 || target->planes[0].texture->params.h != 2160 ||
+        active_y0 < 0 || active_y1 > 2160 || active_y0 >= active_y1)
+        return false;
+    return render_image(rr, image, target, params, active_y0, active_y1);
 }
 
 const struct pl_frame *pl_frame_mix_current(const struct pl_frame_mix *mix)
@@ -3812,6 +4066,7 @@ bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
     params = PL_DEF(params, &pl_render_default_params);
     struct params_info par_info = render_params_info(params);
     pl_dispatch_mark_dynamic(rr->dp, params->dynamic_constants);
+    pl_dispatch_mark_cb1_stable_pq(rr->dp, params->cb1_stable_pq);
 
     require(images->num_frames >= 1);
     require(images->vsync_duration > 0.0);
