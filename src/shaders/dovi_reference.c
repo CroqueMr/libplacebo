@@ -330,10 +330,15 @@ static ident_t reference_el_vertical(pl_shader sh, ident_t raw, bool chroma)
 bool sh_dovi_reference_el_vertical(pl_shader sh, const struct pl_cb1_dovi_reference *data,
                                    const struct pl_frame *image, bool chroma)
 {
-    if (!data || !data->residual || !image || !image->enhancement_layer ||
-        !sh_require(sh,PL_SHADER_SIG_NONE,0,0)) return false;
+    return data && data->residual && image && image->enhancement_layer &&
+        sh_dovi_fel_vertical(sh,image->enhancement_layer,data->el_depth,chroma);
+}
+
+bool sh_dovi_fel_vertical(pl_shader sh,const struct pl_frame *el,unsigned depth,bool chroma)
+{
+    if (!el || !sh_require(sh,PL_SHADER_SIG_NONE,0,0)) return false;
     ident_t raw[3]={0};
-    if (!reference_planes(sh,image->enhancement_layer,data->el_depth,raw,false)) return false;
+    if (!reference_planes(sh,el,depth,raw,false)) return false;
     GLSL("vec4 color=vec4(0.0,0.0,0.0,1.0);\n");
     for (int c=chroma?1:0;c<(chroma?3:1);c++) {
         ident_t vertical=reference_el_vertical(sh,raw[c],chroma);
@@ -358,6 +363,20 @@ static ident_t reference_el_horizontal(pl_shader sh, pl_tex texture, ident_t sam
         GLSLH("s+=%d*"$"(ivec2(x+%d,p.y));\n",weights[t],vertical,t-3);
     GLSLH("return clamp((s+2048)>>12,0,65535);}\n");
     return horizontal;
+}
+
+bool sh_dovi_fel_horizontal(pl_shader sh,pl_tex vertical,unsigned depth,bool chroma)
+{
+    if (!vertical || (depth!=8 && depth!=10) || !sh_require(sh,PL_SHADER_SIG_NONE,0,0)) return false;
+    ident_t sampler=sh_bind(sh,vertical,PL_TEX_ADDRESS_CLAMP,PL_TEX_SAMPLE_NEAREST,
+        "fel_vertical",NULL,NULL,NULL);
+    if (!sampler) return false;
+    GLSL("vec4 color=vec4(0.0,0.0,0.0,1.0);\n");
+    for(int c=0;c<(chroma?2:1);c++){
+        ident_t sample=reference_el_horizontal(sh,vertical,sampler,c,false);
+        GLSL("color[%d]=float("$"(ivec2(gl_FragCoord.xy)))/%u.0;\n",c,sample,(1u<<depth)-1);
+    }
+    return true;
 }
 
 static bool p5_fast_component(pl_shader sh, const struct pl_cb1_dovi_reference *data,
