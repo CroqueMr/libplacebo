@@ -246,6 +246,8 @@ struct pl_cb1_dovi_reference;
 struct pl_frame;
 bool sh_dovi_reference_el_vertical(pl_shader sh, const struct pl_cb1_dovi_reference *data,
     const struct pl_frame *image, bool chroma);
+bool sh_dovi_fel_vertical(pl_shader sh,const struct pl_frame *el,unsigned depth,bool chroma);
+bool sh_dovi_fel_horizontal(pl_shader sh,pl_tex vertical,unsigned depth,bool chroma);
 bool sh_dovi_reference_grid(pl_shader sh, const struct pl_cb1_dovi_reference *data,
     const struct pl_frame *image, bool chroma, pl_tex vertical,
     pl_shader_obj *mmr_state);
