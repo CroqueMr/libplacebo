@@ -198,17 +198,18 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
     limits->thread_safe = params->make_current;
     limits->callbacks = gl_test_ext(gpu, "GL_ARB_sync", 32, 30);
     limits->align_vertex_stride = 1;
-    if (gl_test_ext(gpu, "GL_ARB_pixel_buffer_object", 31, 0)) {
+    if (gl_test_ext(gpu, "GL_ARB_pixel_buffer_object", 31, 30)) {
         limits->max_buf_size = SIZE_MAX; // no restriction imposed by GL
-        if (gl_test_ext(gpu, "GL_ARB_uniform_buffer_object", 31, 0))
+        if (gl_test_ext(gpu, "GL_ARB_uniform_buffer_object", 31, 30))
             get(GL_MAX_UNIFORM_BLOCK_SIZE, &limits->max_ubo_size);
-        if (gl_test_ext(gpu, "GL_ARB_shader_storage_buffer_object", 43, 0) &&
+        if (gl_test_ext(gpu, "GL_ARB_shader_storage_buffer_object", 43, 31) &&
             gpu->glsl.version >= 140)
         {
             get(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &limits->max_ssbo_size);
         }
         limits->max_vbo_size = limits->max_buf_size; // No additional restrictions
-        if (gl_test_ext(gpu, "GL_ARB_buffer_storage", 44, 0)) {
+        if (gl_test_ext(gpu, "GL_ARB_buffer_storage", 44, 0) ||
+            gl_test_ext(gpu, "GL_EXT_buffer_storage", 0, 0)) {
             limits->max_mapped_size = limits->max_buf_size;
             limits->max_mapped_vram = limits->max_buf_size;
             limits->host_cached = strcmp(vendor, "AMD") == 0 ||
@@ -387,7 +388,17 @@ pl_buf gl_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
     gl->GenBuffers(1, &buf_gl->buffer);
     gl->BindBuffer(target, buf_gl->buffer);
 
-    if (gl_test_ext(gpu, "GL_ARB_buffer_storage", 44, 0) && !import) {
+    PFNGLBUFFERSTORAGEPROC storage=NULL;
+    if (gl_test_ext(gpu,"GL_ARB_buffer_storage",44,0)) {
+        storage=gl->BufferStorage;
+    } else if (gl_test_ext(gpu,"GL_EXT_buffer_storage",0,0)) {
+        const struct gl_ctx *ctx=PL_PRIV(p->gl);
+        if (ctx->params.get_proc_addr_ex)
+            storage=(PFNGLBUFFERSTORAGEPROC)ctx->params.get_proc_addr_ex(ctx->params.proc_ctx,"glBufferStorageEXT");
+        else if (ctx->params.get_proc_addr)
+            storage=(PFNGLBUFFERSTORAGEPROC)ctx->params.get_proc_addr("glBufferStorageEXT");
+    }
+    if (storage && !import) {
 
         GLbitfield mapflags = 0, storflags = 0;
         if (params->host_writable)
@@ -399,7 +410,7 @@ pl_buf gl_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
         if (params->memory_type == PL_BUF_MEM_HOST)
             storflags |= GL_CLIENT_STORAGE_BIT; // hopefully this works
 
-        gl->BufferStorage(target, total_size, data, storflags | mapflags);
+        storage(target, total_size, data, storflags | mapflags);
 
         if (params->host_mapped) {
             buf_gl->mapped = true;
