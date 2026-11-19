@@ -593,6 +593,7 @@ enum sampler_dir {
 enum sampler_usage {
     SAMPLER_MAIN,
     SAMPLER_PLANE,
+    SAMPLER_CHROMA,
     SAMPLER_LOWPASS,
 };
 
@@ -610,6 +611,7 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
 {
     const struct pl_render_params *params = pass->params;
     struct sampler_info info = { .usage = usage };
+    bool plane = usage == SAMPLER_PLANE || usage == SAMPLER_CHROMA;
     pl_renderer rr = pass->rr;
 
     float rx = src->new_w / fabsf(pl_rect_w(src->rect));
@@ -639,14 +641,16 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
     case SAMPLER_DOWN:
         if (usage == SAMPLER_LOWPASS) {
             info.config = &pl_filter_bicubic;
-        } else if (usage == SAMPLER_PLANE && params->plane_downscaler) {
+        } else if (plane && params->plane_downscaler) {
             info.config = params->plane_downscaler;
         } else {
             info.config = params->downscaler;
         }
         break;
     case SAMPLER_UP:
-        if (usage == SAMPLER_PLANE && params->plane_upscaler) {
+        if (usage == SAMPLER_CHROMA && params->cb1_fast_chroma) {
+            info.config = &pl_filter_bilinear;
+        } else if (plane && params->plane_upscaler) {
             info.config = params->plane_upscaler;
         } else {
             pl_assert(usage != SAMPLER_LOWPASS);
@@ -718,7 +722,8 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
                              pl_tex target_tex, const struct pl_sample_src *src)
 {
     const struct pl_render_params *params = pass->params;
-    if (usage == SAMPLER_PLANE && !skip_inactive_rows(pass, sh, src->new_h, true))
+    bool plane = usage == SAMPLER_PLANE || usage == SAMPLER_CHROMA;
+    if (plane && !skip_inactive_rows(pass, sh, src->new_h, true))
         return;
     if (!sampler)
         goto fallback;
@@ -802,7 +807,7 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
         src2.rect.y1 = src1.new_h;
 
         pl_shader tsh = pl_dispatch_begin(rr->dp);
-        if (usage == SAMPLER_PLANE && !skip_inactive_rows(pass, tsh, src1.new_h, false)) {
+        if (plane && !skip_inactive_rows(pass, tsh, src1.new_h, false)) {
             pl_dispatch_abort(rr->dp, &tsh);
             ok = false;
             goto done;
@@ -1587,7 +1592,8 @@ static bool want_merge(struct pass_state *pass,
         },
     };
 
-    struct sampler_info info = sample_src_info(pass, &src, SAMPLER_PLANE);
+    enum sampler_usage usage = st->type == PLANE_CHROMA ? SAMPLER_CHROMA : SAMPLER_PLANE;
+    struct sampler_info info = sample_src_info(pass, &src, usage);
     if (info.type == SAMPLER_COMPLEX)
         return true;
 
@@ -1699,7 +1705,9 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
                  src.rect.x0, src.rect.y0, src.rect.x1, src.rect.y1);
 
         pl_shader plane_sh = pl_dispatch_begin_ex(rr->dp, true);
-        dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], SAMPLER_PLANE,
+        enum sampler_usage usage = detect_plane_type(plane, &el->repr) == PLANE_CHROMA ?
+                                   SAMPLER_CHROMA : SAMPLER_PLANE;
+        dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], usage,
                          NULL, &src);
 
         ident_t sub = sh_subpass(sh, plane_sh);
@@ -2036,7 +2044,8 @@ static bool pass_read_image(struct pass_state *pass)
             st->img.tex = NULL;
             st->img.sh = pl_dispatch_begin_ex(rr->dp, true);
             dispatch_sampler(pass, st->img.sh, &rr->samplers_src[i],
-                             SAMPLER_PLANE, NULL, &src);
+                             st->type == PLANE_CHROMA ? SAMPLER_CHROMA : SAMPLER_PLANE,
+                             NULL, &src);
             st->img.err_enum |= PL_RENDER_ERR_SAMPLING;
             st->img.rect.x0 = st->img.rect.y0 = 0.0f;
             st->img.w = st->img.rect.x1 = src.new_w;
@@ -3728,6 +3737,11 @@ error:
     PL_ERR(rr, "Failed rendering image!");
     pass_uninit(&pass);
     return false;
+}
+
+unsigned pl_cb1_chroma_filter_abi(void)
+{
+    return PL_CB1_CHROMA_FILTER_API;
 }
 
 bool pl_render_image(pl_renderer rr, const struct pl_frame *image,

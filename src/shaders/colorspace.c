@@ -316,6 +316,18 @@ static void dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data,
 
         pl_assert(comp->num_pivots >= 2 && comp->num_pivots <= 9);
         struct pl_reshape_data compact;
+        bool common_mmr = comp->num_pivots > 2 && comp->method[0] == 1;
+        for (int i = 1; common_mmr && i < comp->num_pivots - 1; i++)
+            common_mmr = comp->method[i] == 1 && comp->mmr_order[i] == comp->mmr_order[0] &&
+                !memcmp(&comp->mmr_constant[i], &comp->mmr_constant[0], sizeof(float)) &&
+                !memcmp(comp->mmr_coeffs[i], comp->mmr_coeffs[0], sizeof(comp->mmr_coeffs[0]));
+        if (common_mmr) {
+            // Identical intervals share coefficients and the original outer bounds.
+            compact = *comp;
+            compact.pivots[1] = comp->pivots[comp->num_pivots - 1];
+            compact.num_pivots = 2;
+            comp = &compact;
+        }
         bool polynomial = comp->num_pivots > 2;
         for (int i = 0; polynomial && i < comp->num_pivots - 1; i++)
             polynomial = comp->method[i] == 0;

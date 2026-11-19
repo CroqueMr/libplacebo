@@ -366,6 +366,10 @@ struct pl_render_params {
     bool cb1_dovi_transport;
     // Exact native transport sampler cache, default off. Validated GPU only.
     bool cb1_exact_scaler_cache;
+    // CB1 opt-in: bilinear input chroma enlargement; luma and RGB stay unchanged.
+    // Default off. Requires matched renderer headers and library.
+#define PL_CB1_CHROMA_FILTER_API 1
+    bool cb1_fast_chroma;
     // Borrowed opt-in CB1 processing contract. Requires a matched library.
     const struct pl_cb1_dovi_processing *cb1_processing;
 
@@ -744,6 +748,9 @@ PL_API void pl_frame_clear_tiles(pl_gpu gpu, const struct pl_frame *frame,
 PL_API void pl_frames_infer(pl_renderer rr, struct pl_frame *image,
                             struct pl_frame *target);
 
+
+// Matched private CB1 input-chroma renderer ABI.
+PL_API unsigned pl_cb1_chroma_filter_abi(void);
 
 // Render a single image to a target using the given parameters. This is
 // fully dynamic, i.e. the params can change at any time. libplacebo will
