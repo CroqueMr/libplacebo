@@ -44,6 +44,28 @@ PL_API void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *
 // Reconstruct normalized opponent components, without display-management color
 // conversion. Caller owns their representation and subsequent transport.
 #define PL_HAVE_CB1_DOVI_TRANSPORT 1
+#define PL_HAVE_CB1_PROCESSING 5
+
+// CB1-owned source contract. No decoder objects cross this boundary.
+struct pl_cb1_dovi_component {
+    uint8_t num_pivots, method[8], order[8];
+    uint16_t pivots[9];
+    int64_t poly[8][3], constant[8], mmr[8][3][7];
+};
+
+struct pl_cb1_dovi_processing {
+    uint32_t groups, narrow_components, poly_components;
+    uint8_t bit_depth, denominator;
+    struct pl_cb1_dovi_component components[3];
+    pl_tex mmr_texture;
+    pl_tex pq_texture[2];
+};
+#define PL_CB1_PROCESSING_ABI ((PL_HAVE_CB1_PROCESSING << 16) | (unsigned)sizeof(struct pl_cb1_dovi_processing))
+PL_API unsigned pl_cb1_processing_abi(void);
+
+// Borrowed for shader preparation; null preserves the reference path.
+PL_API void pl_shader_dovi_reconstruct_ex(pl_shader sh, struct pl_color_repr *repr,
+    pl_shader enhancement_layer, const struct pl_cb1_dovi_processing *processing);
 PL_API void pl_shader_dovi_reconstruct(pl_shader sh, struct pl_color_repr *repr,
                                         pl_shader enhancement_layer);
 
@@ -60,6 +82,7 @@ struct pl_color_decode_args {
     // and output of the shader depends on the EL being used, based on repr.
     // Currently only Dolby Vision EL is supported.
     pl_shader enhancement_layer;
+    const struct pl_cb1_dovi_processing *cb1_processing;
 };
 
 #define pl_color_decode_args(...) (&(struct pl_color_decode_args) { __VA_ARGS__ })

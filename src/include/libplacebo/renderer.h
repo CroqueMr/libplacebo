@@ -366,6 +366,8 @@ struct pl_render_params {
     bool cb1_dovi_transport;
     // Exact native transport sampler cache, default off. Validated GPU only.
     bool cb1_exact_scaler_cache;
+    // Borrowed opt-in CB1 processing contract. Requires a matched library.
+    const struct pl_cb1_dovi_processing *cb1_processing;
 
 
     // If this is true, all shaders will be generated as "dynamic" shaders,

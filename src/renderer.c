@@ -777,7 +777,8 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
         .antiring    = params->antiringing_strength,
         .no_widening = params->skip_anti_aliasing && usage != SAMPLER_LOWPASS,
         .cb1_fp32_lut = params->cb1_fp32_scaler_lut,
-        .cb1_exact_lut_cache = params->cb1_dovi_transport && params->cb1_exact_scaler_cache,
+        .cb1_exact_lut_cache = (params->cb1_dovi_transport && params->cb1_exact_scaler_cache) ||
+            (params->cb1_processing && (params->cb1_processing->groups & 4)),
         .lut         = lut,
     };
 
@@ -2129,7 +2130,7 @@ static bool pass_read_image(struct pass_state *pass)
         }
 #endif
         if (params->cb1_dovi_transport) {
-            pl_shader_dovi_reconstruct(sh, &pass->img.repr, el_sh);
+            pl_shader_dovi_reconstruct_ex(sh, &pass->img.repr, el_sh, params->cb1_processing);
             // Internal carrier only. The output hook owns opponent encoding.
             pass->img.repr.sys = PL_COLOR_SYSTEM_RGB;
             pass->img.repr.levels = PL_COLOR_LEVELS_FULL;
@@ -2138,6 +2139,7 @@ static bool pass_read_image(struct pass_state *pass)
                 .repr              = &pass->img.repr,
                 .color_adjustment  = params->color_adjustment,
                 .enhancement_layer = el_sh,
+                .cb1_processing    = params->cb1_processing,
             ));
         }
         pl_dispatch_abort(rr->dp, &el_sh);
