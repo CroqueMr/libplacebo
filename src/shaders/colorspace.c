@@ -1319,6 +1319,7 @@ struct sh_color_map_obj {
     // Tone map state
     struct {
         struct pl_tone_map_params params;
+        float cb1_shape[3];
         pl_shader_obj lut;
     } tone;
 
@@ -1930,10 +1931,26 @@ static void visualize_gamut_map(pl_shader sh, pl_rect2df rc,
          lut);
 }
 
+struct tone_lut_params {
+    struct pl_tone_map_params tone;
+    float shape[3];
+};
+
 static void fill_tone_lut(void *data, const struct sh_lut_params *params)
 {
-    const struct pl_tone_map_params *lut_params = params->priv;
-    pl_tone_map_generate(data, lut_params);
+    const struct tone_lut_params *p = params->priv;
+    pl_tone_map_generate(data, &p->tone);
+    if (p->shape[0] == 0 && p->shape[1] == 0 && p->shape[2] == 0)
+        return;
+    float *values = data;
+    const double low = p->tone.output_min, range = p->tone.output_max - low;
+    for (size_t i = 0; i < p->tone.lut_size; i++) {
+        const double x = (values[i] - low) / range, y = 1 - x;
+        const double bend = p->shape[1]*y + p->shape[0]*x - 4*p->shape[2]*x*y;
+        // Fixed endpoints/tangents. For all controls in [-1,1], derivative
+        // >= 1 - 2/(3*sqrt(3)) - 6/16 > .24: no added plateau or reversal.
+        values[i] = low + range * (x + x*x*y*y*bend);
+    }
 }
 
 static void fill_gamut_lut(void *data, const struct sh_lut_params *params)
@@ -1959,11 +1976,52 @@ static void fill_gamut_lut(void *data, const struct sh_lut_params *params)
     pl_free(tmp);
 }
 
+unsigned pl_cb1_expert_tone_abi(void)
+{
+    return PL_CB1_EXPERT_TONE_ABI;
+}
+
 void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *params,
                             const struct pl_color_map_args *args)
 {
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
+    const struct pl_tone_map_params *explicit_tone = args->cb1_tone_map;
+    bool shaped = false;
+    for (int i = 0; i < 3; i++) {
+        if (!isfinite(args->cb1_tone_shape[i]) || fabsf(args->cb1_tone_shape[i]) > 1) {
+            SH_FAIL(sh, "Invalid explicit CB1 Expert curve control");
+            return;
+        }
+        shaped |= args->cb1_tone_shape[i] != 0;
+    }
+    if (shaped && !explicit_tone) {
+        SH_FAIL(sh, "CB1 Expert curve controls require an explicit curve");
+        return;
+    }
+    if (explicit_tone) {
+        const struct pl_tone_map_params *p = explicit_tone;
+        if (!args->state || p->input_scaling != PL_HDR_PQ || p->output_scaling != PL_HDR_PQ ||
+            (p->function != &pl_tone_map_st2094_10 && p->function != &pl_tone_map_clip) ||
+            !isfinite(p->input_min) || !isfinite(p->input_max) || !isfinite(p->input_avg) ||
+            !isfinite(p->output_min) || !isfinite(p->output_max) ||
+            p->input_min < 0 || p->input_min > p->output_min ||
+            p->input_max <= p->input_min || p->input_max > 1 ||
+            p->input_avg < 0 || p->input_avg > p->input_max ||
+            p->output_min < 0 || p->output_min >= p->output_max ||
+            p->output_max > p->input_max || p->lut_size < 2 || p->lut_size > 65536 ||
+            p->param != 0 || !isfinite(p->constants.knee_adaptation) ||
+            !isfinite(p->constants.knee_minimum) || !isfinite(p->constants.knee_maximum) ||
+            !isfinite(p->constants.knee_default) ||
+            p->constants.knee_adaptation < 0 || p->constants.knee_adaptation > 1 ||
+            p->constants.knee_minimum <= 0 || p->constants.knee_minimum >= .5f ||
+            p->constants.knee_maximum <= .5f || p->constants.knee_maximum >= 1 ||
+            p->constants.knee_default < p->constants.knee_minimum ||
+            p->constants.knee_default > p->constants.knee_maximum) {
+            SH_FAIL(sh, "Invalid explicit CB1 Expert tone curve or missing LUT state");
+            return;
+        }
+    }
 
     struct pl_color_space src = args->src, dst = args->dst;
     params = PL_DEF(params, &pl_color_map_default_params);
@@ -1983,7 +2041,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     }
 
     pl_color_space_infer_map(&src, &dst);
-    if (pl_color_space_equal(&src, &dst) && !cb1_neutral_cm29) {
+    if (pl_color_space_equal(&src, &dst) && !cb1_neutral_cm29 && !explicit_tone) {
         if (args->prelinearized)
             pl_shader_delinearize(sh, &dst);
         return;
@@ -2019,6 +2077,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         .out_max    = &tone.output_max,
     ));
 
+    if (explicit_tone) {
+        tone = *explicit_tone;
+    } else {
     pl_tone_map_params_infer(&tone);
 
     // Round sufficiently similar values
@@ -2039,6 +2100,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         // fixes clipping if the metadata is under-reported, which is actually
         // quite common for Dolby Vision content.
         tone.input_max = PL_MAX(tone.input_max, tone.output_max);
+    }
     }
 
     const int *lut3d_size_def = pl_color_map_default_params.lut3d_size;
@@ -2109,7 +2171,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         pl_unreachable();
     }
 
-    bool can_fast = !params->force_tone_mapping_lut;
+    bool can_fast = !params->force_tone_mapping_lut && !explicit_tone;
     if (!args->state) {
         // No state object provided, forcibly disable advanced methods
         can_fast = true;
@@ -2122,10 +2184,13 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     pl_fmt gamut_fmt = pl_find_fmt(SH_GPU(sh), PL_FMT_UNORM, 4, 16, 16, PL_FMT_CAP_LINEAR);
     if (!gamut_fmt) {
         gamut.function = &pl_gamut_map_saturation;
-        can_fast = true;
+        can_fast = !explicit_tone;
     }
 
-    bool need_tone_map = !pl_tone_map_params_noop(&tone);
+    // Equal declared ranges still require the explicit lower-domain clamp:
+    // pixels below the display-adapted minimum have not been mapped yet.
+    bool need_tone_map = !pl_tone_map_params_noop(&tone) ||
+                         (explicit_tone && (tone.input_min > 0 || shaped));
     bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
     bool cb1_direct_rgb_output = cb1_neutral_cm29 && !need_gamut_map &&
                                  src.primaries == dst.primaries;
@@ -2240,6 +2305,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                 SH_FAIL(sh, "CB policy requires FP32 linear tone-LUT storage!");
                 return;
             }
+            struct tone_lut_params lut_params = {.tone=tone};
+            memcpy(lut_params.shape, args->cb1_tone_shape, sizeof(lut_params.shape));
             ident_t lut = sh_lut(sh, sh_lut_params(
                 .object     = &obj->tone.lut,
                 .var_type   = PL_VAR_FLOAT,
@@ -2248,12 +2315,14 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                 .method     = SH_LUT_LINEAR,
                 .width      = tone.lut_size,
                 .comps      = 1,
-                .update     = !pl_tone_map_params_equal(&tone, &obj->tone.params),
+                .update     = !pl_tone_map_params_equal(&tone, &obj->tone.params) ||
+                              memcmp(lut_params.shape, obj->tone.cb1_shape, sizeof(lut_params.shape)),
                 .dynamic    = tone.input_avg > 0, // dynamic metadata
                 .fill       = fill_tone_lut,
-                .priv       = &tone,
+                .priv       = &lut_params,
             ));
             obj->tone.params = tone;
+            memcpy(obj->tone.cb1_shape, lut_params.shape, sizeof(lut_params.shape));
             if (!lut) {
                 SH_FAIL(sh, "Failed generating tone-mapping LUT!");
                 return;
