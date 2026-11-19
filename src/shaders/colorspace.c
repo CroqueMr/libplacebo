@@ -692,18 +692,24 @@ void pl_shader_decode_color_ex(pl_shader sh,
             cb1_colour_dense_eotf(sh);
             GLSL("color.rgb = "$" * color.rgb;\n}\n",mat);
         }
-        // PQ OETF
-        bool coarse_encode=cb1_colour_lookup(sh,args->cb1_processing,true);
-        if (SH_PARAMS(sh).cb1_stable_pq) {
-            cb1_pq_oetf(sh, "color.rgb");
+        if (args->cb1_dovi_linear) {
+            // Match pl_shader_linearize(PQ): 203-nit-relative linear RGB.
+            GLSL("color.rgb = max(color.rgb, 0.0) * vec3(%f); \n",
+                 10000.0 / PL_COLOR_SDR_WHITE);
         } else {
-        GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(%f));       \n"
-             "color.rgb = (vec3(%f) + vec3(%f) * color.rgb)         \n"
-             "             / (vec3(1.0) + vec3(%f) * color.rgb);    \n"
-             "color.rgb = pow(color.rgb, vec3(%f));                 \n",
-             PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
+            // PQ OETF
+            bool coarse_encode=cb1_colour_lookup(sh,args->cb1_processing,true);
+            if (SH_PARAMS(sh).cb1_stable_pq) {
+                cb1_pq_oetf(sh, "color.rgb");
+            } else {
+                GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(%f));       \n"
+                     "color.rgb = (vec3(%f) + vec3(%f) * color.rgb)         \n"
+                     "             / (vec3(1.0) + vec3(%f) * color.rgb);    \n"
+                     "color.rgb = pow(color.rgb, vec3(%f));                 \n",
+                     PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
+            }
+            if (coarse_encode) GLSL("}\n");
         }
-        if (coarse_encode) GLSL("}\n");
         break;
 #else
         SH_FAIL(sh, "libplacebo was compiled without support for dolbyvision reshaping");
@@ -1932,6 +1938,13 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         return;
 
     struct pl_color_space src = args->src, dst = args->dst;
+    params = PL_DEF(params, &pl_color_map_default_params);
+    const bool cb1_neutral_cm29 = params->cb1_neutral_cm29 &&
+        args->prelinearized && dst.transfer == PL_COLOR_TRC_LINEAR &&
+        src.primaries == PL_COLOR_PRIM_BT_2020 &&
+        isfinite(params->cb1_neutral_cm29_peak) &&
+        params->cb1_neutral_cm29_peak > 0.0f &&
+        params->cb1_neutral_cm29_peak <= 10000.0f;
     struct sh_color_map_obj *obj = NULL;
     if (args->state) {
         pl_get_detected_hdr_metadata(*args->state, &src.hdr);
@@ -1942,13 +1955,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     }
 
     pl_color_space_infer_map(&src, &dst);
-    if (pl_color_space_equal(&src, &dst)) {
+    if (pl_color_space_equal(&src, &dst) && !cb1_neutral_cm29) {
         if (args->prelinearized)
             pl_shader_delinearize(sh, &dst);
         return;
     }
 
-    params = PL_DEF(params, &pl_color_map_default_params);
     GLSL("// pl_shader_color_map \n"
          "{                      \n");
 
@@ -2005,7 +2017,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     struct pl_gamut_map_params gamut = {
         .function        = PL_DEF(params->gamut_mapping, &pl_gamut_map_clip),
         .constants       = params->gamut_constants,
-        .input_gamut     = src.hdr.prim,
+        .input_gamut     = cb1_neutral_cm29 ?
+                           *pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020) : src.hdr.prim,
         .output_gamut    = dst.hdr.prim,
         .lut_size_I      = PL_DEF(params->lut3d_size[0], lut3d_size_def[0]),
         .lut_size_C      = PL_DEF(params->lut3d_size[1], lut3d_size_def[1]),
@@ -2086,9 +2099,17 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
 
     bool need_tone_map = !pl_tone_map_params_noop(&tone);
     bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
+    bool cb1_direct_rgb_output = cb1_neutral_cm29 && !need_gamut_map &&
+                                 src.primaries == dst.primaries;
 
     if (!args->prelinearized)
         pl_shader_linearize(sh, &src);
+
+    // Preserve the neutral CM29 first-map clamp before any fast return.
+    if (cb1_neutral_cm29 && !need_tone_map) {
+        GLSL("color.rgb = clamp(color.rgb, 0.0, %f);\n",
+             params->cb1_neutral_cm29_peak / PL_COLOR_SDR_WHITE);
+    }
 
     pl_matrix3x3 rgb2lms = pl_ipt_rgb2lms(pl_raw_primaries_get(src.primaries));
     pl_matrix3x3 lms2rgb = pl_ipt_lms2rgb(pl_raw_primaries_get(dst.primaries));
@@ -2273,6 +2294,42 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
              "ipt.yz *= min(i_orig / ipt.x, hull.y / hull.x);   \n");
     }
 
+    if (cb1_neutral_cm29 && need_tone_map) {
+        const ident_t bt2020_lms2rgb = SH_MAT3(pl_ipt_lms2rgb(
+            pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020)));
+        GLSL("vec3 cb1_check_pq = "$" * ipt;                                   \n"
+             "vec3 cb1_check_lms = pow(max(cb1_check_pq, 0.0), vec3(1.0/%f)); \n"
+             "cb1_check_lms = max(cb1_check_lms - vec3(%f), 0.0)              \n"
+             "    / (vec3(%f) - %f * cb1_check_lms);                           \n"
+             "cb1_check_lms = pow(cb1_check_lms, vec3(1.0/%f)) * %f;           \n"
+             "vec3 cb1_check_rgb = "$" * cb1_check_lms;                       \n"
+             "bool cb1_check_no_nan = all(equal(cb1_check_rgb, cb1_check_rgb)); \n",
+             ipt2lms,
+             PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1, 10000 / PL_COLOR_SDR_WHITE,
+             bt2020_lms2rgb);
+        if (cb1_direct_rgb_output) {
+            GLSL("if (cb1_check_no_nan) {                                      \n"
+                 "    color.rgb = clamp(cb1_check_rgb, 0.0, %f);               \n"
+                 "} else {                                                     \n",
+                 params->cb1_neutral_cm29_peak / PL_COLOR_SDR_WHITE);
+        } else {
+            GLSL("if (cb1_check_no_nan && (any(lessThan(cb1_check_rgb, vec3(0.0))) ||\n"
+                 "    any(greaterThan(cb1_check_rgb, vec3(%f))))) {            \n"
+                 "    cb1_check_rgb = clamp(cb1_check_rgb, 0.0, %f);           \n"
+                 "    vec3 cb1_clip_lms = "$" * cb1_check_rgb;                \n"
+                 "    cb1_clip_lms = pow(max(cb1_clip_lms * %f, 0.0), vec3(%f));\n"
+                 "    cb1_clip_lms = (vec3(%f) + %f * cb1_clip_lms)            \n"
+                 "        / (vec3(1.0) + %f * cb1_clip_lms);                    \n"
+                 "    cb1_clip_lms = pow(cb1_clip_lms, vec3(%f));              \n"
+                 "    ipt = "$" * cb1_clip_lms;                               \n"
+                 "}                                                            \n",
+                 params->cb1_neutral_cm29_peak / PL_COLOR_SDR_WHITE,
+                 params->cb1_neutral_cm29_peak / PL_COLOR_SDR_WHITE,
+                 SH_MAT3(rgb2lms), PL_COLOR_SDR_WHITE / 10000, PQ_M1,
+                 PQ_C1, PQ_C2, PQ_C3, PQ_M2, lms2ipt);
+        }
+    }
+
     if (need_gamut_map) {
         const struct pl_gamut_map_function *fun = gamut.function;
         sh_describef(sh, "gamut map (%s)", fun->name);
@@ -2340,6 +2397,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          10000 / PL_COLOR_SDR_WHITE,
          SH_MAT3(lms2rgb));
     }
+
+    if (cb1_direct_rgb_output && need_tone_map)
+        GLSL("}\n");
 
     if (params->show_clipping) {
         GLSL("if (clip_hi) {                                                \n"

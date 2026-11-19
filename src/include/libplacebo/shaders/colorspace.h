@@ -44,7 +44,7 @@ PL_API void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *
 // Reconstruct normalized opponent components, without display-management color
 // conversion. Caller owns their representation and subsequent transport.
 #define PL_HAVE_CB1_DOVI_TRANSPORT 1
-#define PL_HAVE_CB1_PROCESSING 5
+#define PL_HAVE_CB1_PROCESSING 7
 
 // CB1-owned source contract. No decoder objects cross this boundary.
 struct pl_cb1_dovi_component {
@@ -83,6 +83,9 @@ struct pl_color_decode_args {
     // Currently only Dolby Vision EL is supported.
     pl_shader enhancement_layer;
     const struct pl_cb1_dovi_processing *cb1_processing;
+    // Return DOVI as lower-clipped linear RGB relative to PL_COLOR_SDR_WHITE.
+    // Ignored for all other color systems. Default false preserves PQ RGB.
+    bool cb1_dovi_linear;
 };
 
 #define pl_color_decode_args(...) (&(struct pl_color_decode_args) { __VA_ARGS__ })
@@ -366,6 +369,11 @@ struct pl_color_map_params {
     PL_DEPRECATED_IN(v6.269) enum pl_rendering_intent intent; // see `gamut_mapping`
     PL_DEPRECATED_IN(v6.269) enum pl_gamut_mode gamut_mode;   // see `gamut_mapping`
     PL_DEPRECATED_IN(v6.290) float hybrid_mix;                // removed
+
+    // CB1 Expert opt-in: fuse neutral-CM29 clipping into the final gamut map.
+    // Disabled by default. Peak is in nits.
+    bool cb1_neutral_cm29;
+    float cb1_neutral_cm29_peak;
 };
 
 #define PL_COLOR_MAP_DEFAULTS                                   \

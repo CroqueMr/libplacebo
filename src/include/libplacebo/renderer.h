@@ -364,6 +364,9 @@ struct pl_render_params {
     // RGB; a caller-provided output hook packs them with matching DM matrices.
     // Requires 1:1 geometry, no color operations/overlays and matched headers.
     bool cb1_dovi_transport;
+    // CB1 opt-in: return DOVI decode in 203-nit-relative linear RGB.
+    // Default false; requires neutral inputs, before any linear scaling.
+    bool cb1_dovi_linear;
     // Exact native transport sampler cache, default off. Validated GPU only.
     bool cb1_exact_scaler_cache;
     // CB1 opt-in: bilinear input chroma enlargement; luma and RGB stay unchanged.

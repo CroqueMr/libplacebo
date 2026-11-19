@@ -2144,12 +2144,26 @@ static bool pass_read_image(struct pass_state *pass)
             pass->img.repr.sys = PL_COLOR_SYSTEM_RGB;
             pass->img.repr.levels = PL_COLOR_LEVELS_FULL;
         } else {
+            const struct pl_color_adjustment *adj = params->color_adjustment;
+            bool neutral_adjustment = !adj ||
+                (adj->brightness == 0.0f && adj->contrast == 1.0f &&
+                 adj->saturation == 1.0f && adj->hue == 0.0f &&
+                 adj->gamma == 1.0f && adj->temperature == 0.0f);
+            bool dovi_linear = params->cb1_dovi_linear &&
+                image->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+                pass->img.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+                pass->rotation == PL_ROTATION_0 &&
+                !params->disable_linear_scaling &&
+                !image->icc && !image->lut && !params->lut && neutral_adjustment;
             pl_shader_decode_color_ex(sh, pl_color_decode_args(
                 .repr              = &pass->img.repr,
                 .color_adjustment  = params->color_adjustment,
                 .enhancement_layer = el_sh,
                 .cb1_processing    = params->cb1_processing,
+                .cb1_dovi_linear   = dovi_linear,
             ));
+            if (dovi_linear)
+                pass->img.color.transfer = PL_COLOR_TRC_LINEAR;
         }
         pl_dispatch_abort(rr->dp, &el_sh);
     }
