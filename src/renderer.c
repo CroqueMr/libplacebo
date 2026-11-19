@@ -1622,11 +1622,67 @@ static bool want_merge(struct pass_state *pass,
 static int frame_ref(const struct pl_frame *frame);
 
 #ifdef PL_HAVE_DOVI
+// Reuse the reference EL filters without changing BL reconstruction.
+static bool prepare_reference_el(struct pass_state *pass, const struct pl_frame *el,
+                                 struct pl_frame *out)
+{
+    pl_renderer rr = pass->rr;
+    const pl_rect2df bl = pass->image.crop;
+    unsigned depth = el->repr.bits.color_depth;
+    if (bl.x0 || bl.y0 || !pl_cb1_dovi_reference_frame_supported(el, depth))
+        return false;
+    *out = *el;
+    int w = el->crop.x1, h = el->crop.y1;
+    if (w == bl.x1 && h == bl.y1)
+        return true;
+    if (w * 2 != bl.x1 || h * 2 != bl.y1 || w % 2 || h % 2)
+        return false;
+
+    out->num_planes = 2;
+    out->crop = (pl_rect2df) {0, 0, w * 2, h * 2};
+    out->repr.bits = (struct pl_bit_encoding) {.sample_depth=depth, .color_depth=depth};
+    for (int c = 0; c < 2; c++) {
+        pl_fmt fmt = pl_find_fmt(rr->gpu, PL_FMT_FLOAT, c ? 2 : 1, 32, 32,
+                                 PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR);
+        if (!fmt) return false;
+        pl_tex vertical = get_fbo(pass, c ? w/2 : w, c ? h : h*2, fmt, c ? 2 : 1, PL_DEBUG_TAG);
+        pl_shader sh = pl_dispatch_begin(rr->dp);
+        bool ok = vertical && sh_dovi_fel_vertical(sh, el, depth, c) &&
+            pl_dispatch_finish(rr->dp, pl_dispatch_params(.shader=&sh, .target=vertical));
+        pl_dispatch_abort(rr->dp, &sh);
+        if (!ok) return false;
+        pl_tex horizontal = get_fbo(pass, c ? w : w*2, c ? h : h*2, fmt, c ? 2 : 1, PL_DEBUG_TAG);
+        sh = pl_dispatch_begin(rr->dp);
+        ok = horizontal && sh_dovi_fel_horizontal(sh, vertical, depth, c) &&
+            pl_dispatch_finish(rr->dp, pl_dispatch_params(.shader=&sh, .target=horizontal));
+        pl_dispatch_abort(rr->dp, &sh);
+        if (!ok) return false;
+        const struct pl_plane *source = &el->planes[0];
+        for (int p = 0; p < el->num_planes; p++)
+            if (el->planes[p].component_mapping[0] == c)
+                source = &el->planes[p];
+        out->planes[c] = (struct pl_plane) {
+            .texture=horizontal, .components=c ? 2 : 1,
+            .component_mapping={c, c ? 2 : -1, -1, -1},
+            .shift_x=source->shift_x, .shift_y=source->shift_y,
+        };
+    }
+    return true;
+}
+
 // Build a sub-shader that samples the enhancement layer planes and returns
 // the (color-repr-normalized) EL signal.
 static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
 {
     pl_renderer rr = pass->rr;
+    struct pl_frame prepared;
+    if (pass->params->cb1_fel_filter == 2) {
+        if (!prepare_reference_el(pass, el, &prepared)) {
+            PL_ERR(rr, "Reference FEL filter: unsupported EL layout or enlargement");
+            return NULL;
+        }
+        el = &prepared;
+    }
     pl_shader sh = pl_dispatch_begin_ex(rr->dp, true);
     if (!sh_require(sh, PL_SHADER_SIG_NONE, 0, 0))
         return NULL;
@@ -1652,17 +1708,22 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
     }
 
     float layer_x = 0, layer_y = 0;
-    if (el_ref->params.w < ref_tex->params.w || el_ref->params.h < ref_tex->params.h) {
+    const bool reference_el = pass->params->cb1_fel_filter == 2;
+    float bl_w = reference_el ? bl_crop.x1 : ref_tex->params.w;
+    float bl_h = reference_el ? bl_crop.y1 : ref_tex->params.h;
+    float el_w = reference_el ? el->crop.x1 : el_ref->params.w;
+    float el_h = reference_el ? el->crop.y1 : el_ref->params.h;
+    if (el_w < bl_w || el_h < bl_h) {
         float lx, ly;
         pl_chroma_location_offset(PL_CHROMA_LEFT, &lx, &ly);
-        if (el_ref->params.w < ref_tex->params.w)
+        if (el_w < bl_w)
             layer_x = lx;
-        if (el_ref->params.h < ref_tex->params.h)
+        if (el_h < bl_h)
             layer_y = ly;
     }
 
-    float lrx = (float) el_ref->params.w / ref_tex->params.w,
-          lry = (float) el_ref->params.h / ref_tex->params.h;
+    float lrx = el_w / bl_w,
+          lry = el_h / bl_h;
     float rlx = lrx >= 1 ? roundf(lrx) : 1.0 / roundf(1.0 / lrx),
           rly = lry >= 1 ? roundf(lry) : 1.0 / roundf(1.0 / lry);
 
@@ -1709,13 +1770,13 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
         pl_shader plane_sh = pl_dispatch_begin_ex(rr->dp, true);
         enum sampler_usage usage = detect_plane_type(plane, &el->repr) == PLANE_CHROMA ?
                                    SAMPLER_CHROMA : SAMPLER_PLANE;
-        if (pass->params->cb1_fel_nearest) {
+        if (pass->params->cb1_fel_filter) {
             if (plane->flipped) {
                 src.rect.y0 = plane->texture->params.h - src.rect.y0;
                 src.rect.y1 = plane->texture->params.h - src.rect.y1;
             }
             if (usage != SAMPLER_PLANE || skip_inactive_rows(pass, plane_sh, src.new_h, true))
-                pl_shader_sample_nearest(plane_sh, &src);
+                pl_shader_sample_bilinear(plane_sh, &src);
         } else {
             dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], usage,
                              NULL, &src);
@@ -2273,6 +2334,10 @@ static bool pass_read_image(struct pass_state *pass)
         if (compose_el) {
             el_sh = sample_el(pass, image->enhancement_layer);
             if (!el_sh) {
+                if (params->cb1_fel_filter == 2) {
+                    PL_ERR(rr, "Reference FEL filtering failed; refusing BL-only reconstruction");
+                    return false;
+                }
                 PL_ERR(rr, "Failed sampling enhancement layer; "
                            "falling back to base-layer-only rendering");
                 rr->errors |= PL_RENDER_ERR_SAMPLING;

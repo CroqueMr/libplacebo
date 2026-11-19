@@ -418,7 +418,25 @@ struct pl_color_map_args {
     // `pl_shader_extract_features`. Optional. No effect if
     // `params->contrast_recovery` is disabled.
     pl_tex feature_map;
+
+    // CB1 Expert opt-in. Explicit forward tone curve in PQ units, independent
+    // of the target signal gamut's black floor. All values are copied during
+    // this call; the caller owns the immutable parameters until it returns.
+    // input_min may describe the display-adapted curve domain (not source
+    // mastering metadata), bounded by output_min.
+    // Requires a state object and a matched rebuilt library/consumer ABI.
+    // PQ units, finite ordered bounds, no legacy param. Only ST2094-10/clip
+    // are admitted. Native LUT
+    // generation still performs its documented scaling/constants inference;
+    // no source/destination metadata is changed to smuggle scene statistics.
+    const struct pl_tone_map_params *cb1_tone_map;
+    // Expert-only signed curve controls: slope, offset, power in [-1,1].
+    // Zero is exactly neutral. Baked into the existing PQ LUT, not RGB SOP.
+    float cb1_tone_shape[3];
 };
+
+#define PL_CB1_EXPERT_TONE_ABI ((1u << 16) | (unsigned)sizeof(struct pl_color_map_args))
+PL_API unsigned pl_cb1_expert_tone_abi(void);
 
 #define pl_color_map_args(...) (&(struct pl_color_map_args) { __VA_ARGS__ })
 
