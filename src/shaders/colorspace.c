@@ -23,6 +23,36 @@
 
 #include <libplacebo/shaders/colorspace.h>
 
+// Original ST2084 constants, guards and domain. Avoid a rounded near-unity root.
+// Fixed expm1 P5(z/16) seed and four doublings; analytic 1/n! coefficients,
+// bounded primitive approximation, not a fitted curve or an exact identity.
+static void cb1_pq_eotf(pl_shader sh, const char *signal)
+{
+    GLSL("{ for (int cb1_pq_i = 0; cb1_pq_i < 3; cb1_pq_i++) {\n"
+         "float cb1_pq_q = %s[cb1_pq_i];\n"
+         "if (cb1_pq_q <= 0.0) { %s[cb1_pq_i] = 0.0; } else {\n"
+         "float cb1_pq_log = log(cb1_pq_q), cb1_pq_z = cb1_pq_log / 78.84375, cb1_pq_y = cb1_pq_z / 16.0;\n"
+         "float cb1_pq_d = -cb1_pq_y * (1.0 + cb1_pq_y * (0.5 + cb1_pq_y * ((1.0/6.0) + cb1_pq_y * ((1.0/24.0) + cb1_pq_y/120.0))));\n"
+         "cb1_pq_d = cb1_pq_d * (2.0 - cb1_pq_d);\n"
+         "cb1_pq_d = cb1_pq_d * (2.0 - cb1_pq_d);\n"
+         "cb1_pq_d = cb1_pq_d * (2.0 - cb1_pq_d);\n"
+         "cb1_pq_d = cb1_pq_d * (2.0 - cb1_pq_d);\n"
+         "%s[cb1_pq_i] = max(0.1640625 - cb1_pq_d, 0.0) / (0.1640625 + 18.6875 * cb1_pq_d);\n"
+         "} } }\n"
+         "%s = pow(%s, vec3(1.0/0.1593017578125));\n",
+         signal, signal, signal, signal, signal);
+}
+
+static void cb1_pq_oetf(pl_shader sh, const char *signal)
+{
+    GLSL("{\n"
+         "vec3 v = pow(max(%s, 0.0), vec3(0.1593017578125));\n"
+         "v = vec3(1.0) - 0.1640625 * (vec3(1.0) - v) / (vec3(1.0) + 18.6875 * v);\n"
+         "vec3 v2=v*v, v4=v2*v2, v8=v4*v4, v16=v8*v8, v32=v16*v16, v64=v32*v32;\n"
+         "%s = ((v64*v8)*v4)*v2*pow(v, vec3(0.84375));\n"
+         "}\n", signal, signal);
+}
+
 void pl_shader_set_alpha(pl_shader sh, struct pl_color_repr *repr,
                          enum pl_alpha_mode mode)
 {
@@ -466,19 +496,27 @@ void pl_shader_decode_color_ex(pl_shader sh,
         });
 
         // PQ EOTF
+        if (SH_PARAMS(sh).cb1_stable_pq) {
+            cb1_pq_eotf(sh, "color.rgb");
+        } else {
         GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(1.0/%f));   \n"
              "color.rgb = max(color.rgb - vec3(%f), 0.0)            \n"
              "             / (vec3(%f) - vec3(%f) * color.rgb);     \n"
              "color.rgb = pow(color.rgb, vec3(1.0/%f));             \n",
              PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1);
+        }
         // LMS matrix
         GLSL("color.rgb = "$" * color.rgb; \n", mat);
         // PQ OETF
+        if (SH_PARAMS(sh).cb1_stable_pq) {
+            cb1_pq_oetf(sh, "color.rgb");
+        } else {
         GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(%f));       \n"
              "color.rgb = (vec3(%f) + vec3(%f) * color.rgb)         \n"
              "             / (vec3(1.0) + vec3(%f) * color.rgb);    \n"
              "color.rgb = pow(color.rgb, vec3(%f));                 \n",
              PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
+        }
         break;
 #else
         SH_FAIL(sh, "libplacebo was compiled without support for dolbyvision reshaping");
@@ -726,6 +764,11 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
         GLSL("color.rgb = vec3(52.37/48.0) * pow(color.rgb, vec3(2.6));\n");
         goto scale_out;
     case PL_COLOR_TRC_PQ:
+        if (SH_PARAMS(sh).cb1_stable_pq) {
+            cb1_pq_eotf(sh, "color.rgb");
+            GLSL("color.rgb *= vec3(%f);\n", 10000.0 / PL_COLOR_SDR_WHITE);
+            return;
+        }
         GLSL("color.rgb = pow(color.rgb, vec3(1.0/%f));         \n"
              "color.rgb = max(color.rgb - vec3(%f), 0.0)        \n"
              "             / (vec3(%f) - vec3(%f) * color.rgb); \n"
@@ -865,6 +908,11 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
              "                lessThanEqual(vec3(0.001953), color.rgb));     \n");
         return;
     case PL_COLOR_TRC_PQ:
+        if (SH_PARAMS(sh).cb1_stable_pq) {
+            GLSL("color.rgb *= vec3(1.0/%f);\n", 10000 / PL_COLOR_SDR_WHITE);
+            cb1_pq_oetf(sh, "color.rgb");
+            return;
+        }
         GLSL("color.rgb *= vec3(1.0/%f);                         \n"
              "color.rgb = pow(color.rgb, vec3(%f));              \n"
              "color.rgb = (vec3(%f) + vec3(%f) * color.rgb)      \n"
@@ -1880,6 +1928,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     }
 
     // Full path: convert input from normalized RGB to IPT
+    if (SH_PARAMS(sh).cb1_stable_pq) {
+        GLSL("vec3 lms = "$" * color.rgb;\n"
+             "vec3 lmspq = %f * lms;\n", SH_MAT3(rgb2lms), PL_COLOR_SDR_WHITE / 10000);
+        cb1_pq_oetf(sh, "lmspq");
+        GLSL("vec3 ipt = "$" * lmspq;\nfloat i_orig = ipt.x;\n", lms2ipt);
+    } else {
     GLSL("vec3 lms = "$" * color.rgb;               \n"
          "vec3 lmspq = %f * lms;                    \n"
          "lmspq = pow(max(lmspq, 0.0), vec3(%f));   \n"
@@ -1892,6 +1946,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          PL_COLOR_SDR_WHITE / 10000,
          PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2,
          lms2ipt);
+    }
 
     if (params->show_clipping) {
         const float eps = 1e-6f;
@@ -2081,6 +2136,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     }
 
     // Convert IPT back to linear RGB
+    if (SH_PARAMS(sh).cb1_stable_pq) {
+        GLSL("lmspq = "$" * ipt;\nlms = lmspq;\n", ipt2lms);
+        cb1_pq_eotf(sh, "lms");
+        GLSL("lms *= %f;\ncolor.rgb = "$" * lms;\n", 10000 / PL_COLOR_SDR_WHITE, SH_MAT3(lms2rgb));
+    } else {
     GLSL("lmspq = "$" * ipt;                        \n"
          "lms = pow(max(lmspq, 0.0), vec3(1.0/%f)); \n"
          "lms = max(lms - vec3(%f), 0.0)            \n"
@@ -2092,6 +2152,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
          10000 / PL_COLOR_SDR_WHITE,
          SH_MAT3(lms2rgb));
+    }
 
     if (params->show_clipping) {
         GLSL("if (clip_hi) {                                                \n"

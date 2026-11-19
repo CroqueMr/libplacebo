@@ -45,6 +45,7 @@ struct pl_dispatch_t {
     uint8_t current_ident;
     uint8_t current_index;
     bool dynamic_constants;
+    bool cb1_stable_pq;
     int max_passes;
 
     void (*info_callback)(void *, const struct pl_dispatch_info *);
@@ -151,6 +152,7 @@ pl_shader pl_dispatch_begin_ex(pl_dispatch dp, bool unique)
         .gpu = dp->gpu,
         .index = dp->current_index,
         .dynamic_constants = dp->dynamic_constants,
+        .cb1_stable_pq = dp->cb1_stable_pq,
     };
 
     pl_shader sh = NULL;
@@ -168,6 +170,11 @@ pl_shader pl_dispatch_begin_ex(pl_dispatch dp, bool unique)
 void pl_dispatch_mark_dynamic(pl_dispatch dp, bool dynamic)
 {
     dp->dynamic_constants = dynamic;
+}
+
+void pl_dispatch_mark_cb1_stable_pq(pl_dispatch dp, bool enabled)
+{
+    dp->cb1_stable_pq = enabled;
 }
 
 void pl_dispatch_callback(pl_dispatch dp, void *priv,

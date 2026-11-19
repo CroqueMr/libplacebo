@@ -349,6 +349,9 @@ struct pl_render_params {
     // Default false preserves all existing callers. Requires matching
     // CB-patched headers and library; this is not an upstream ABI field.
     bool cb1_nearest_identity;
+    // CB policy-only equivalent ST2084 FP32 realization, default off.
+    // Requires matched renderer/shader/dispatch headers and library.
+    bool cb1_stable_pq;
 
     // If this is true, all shaders will be generated as "dynamic" shaders,
     // with any compile-time constants being replaced by runtime-adjustable
