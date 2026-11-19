@@ -305,6 +305,8 @@ pl_pass gl_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
             break;
         }
         case PL_DESC_BUF_STORAGE: {
+            if (p->gles_ver)
+                break; // GLSL ES specifies the binding in the shader.
             GLuint idx = gl->GetProgramResourceIndex(pass_gl->program,
                                                      GL_SHADER_STORAGE_BLOCK,
                                                      desc->name);

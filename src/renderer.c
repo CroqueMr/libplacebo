@@ -1647,7 +1647,7 @@ static bool prepare_reference_el(struct pass_state *pass, const struct pl_frame 
         if (!fmt) return false;
         pl_tex vertical = get_fbo(pass, c ? w/2 : w, c ? h : h*2, fmt, c ? 2 : 1, PL_DEBUG_TAG);
         pl_shader sh = pl_dispatch_begin(rr->dp);
-        bool ok = vertical && sh_dovi_fel_vertical(sh, el, depth, c) &&
+        bool ok = vertical && sh_dovi_fel_vertical(sh, el, depth, c, false) &&
             pl_dispatch_finish(rr->dp, pl_dispatch_params(.shader=&sh, .target=vertical));
         pl_dispatch_abort(rr->dp, &sh);
         if (!ok) return false;
@@ -1808,11 +1808,11 @@ unsigned pl_cb1_fel_filter_abi(void)
     return PL_CB1_FEL_FILTER_API;
 }
 
-static bool skip_reference_chroma_rows(struct pass_state *pass, pl_shader sh)
+static bool skip_reference_rows(struct pass_state *pass, pl_shader sh, int divisor)
 {
     if (pass->cb1_active_rows[1]<=pass->cb1_active_rows[0]) return true;
-    float bounds[2]={floorf(pass->cb1_active_rows[0]/2)-4,
-                     ceilf(pass->cb1_active_rows[1]/2)+4};
+    float bounds[2]={floorf(pass->cb1_active_rows[0]/divisor)-4,
+                     ceilf(pass->cb1_active_rows[1]/divisor)+4};
     enum pl_shader_sig signature=sh->output;
     if (!sh_require(sh,signature,0,0)) return false;
     sh->output=signature;
@@ -1836,7 +1836,7 @@ static bool pass_read_dovi_reference(struct pass_state *pass)
                               PL_FMT_CAP_RENDERABLE|PL_FMT_CAP_SAMPLEABLE|PL_FMT_CAP_LINEAR);
         pl_tex chroma=fmt?get_fbo(pass,w/2,h/2,fmt,2,PL_DEBUG_TAG):NULL;
         pl_shader sh=pl_dispatch_begin(pass->rr->dp);
-        bool ok=chroma && skip_reference_chroma_rows(pass,sh) &&
+        bool ok=chroma && skip_reference_rows(pass,sh,2) &&
             sh_dovi_p5_fast_grid(sh,data,image,true) &&
             pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=chroma));
         pl_dispatch_abort(pass->rr->dp,&sh);
@@ -1877,11 +1877,17 @@ static bool pass_read_dovi_reference(struct pass_state *pass)
         if (!fmt) return false;
         pl_tex vertical=NULL;
         if (resize) {
-            /* FP32 stores every rounded 16-bit intermediate exactly. */
-            vertical=get_fbo(pass,c?w/4:w/2,c?h/2:h,fmt,c?2:1,PL_DEBUG_TAG);
+            const struct pl_bit_encoding bits=el->repr.bits;
+            int storage=bits.sample_depth?bits.sample_depth:data->el_depth;
+            // Bound all possible storage words, including out-of-range padding.
+            bool packed_rows=data->contract==2 && bits.bit_shift>=0 && bits.bit_shift<storage &&
+                storage-bits.bit_shift<=10;
+            int height=(c?h/2:h)/(packed_rows?2:1);
+            vertical=get_fbo(pass,c?w/4:w/2,height,fmt,c?2:1,PL_DEBUG_TAG);
             pl_shader sh=pl_dispatch_begin(pass->rr->dp);
-            bool rows=c?skip_reference_chroma_rows(pass,sh):skip_inactive_rows(pass,sh,h,false);
-            bool ok=vertical && rows && sh_dovi_reference_el_vertical(sh,data,image,c) &&
+            bool rows=packed_rows?skip_reference_rows(pass,sh,c?4:2):
+                c?skip_reference_rows(pass,sh,2):skip_inactive_rows(pass,sh,h,false);
+            bool ok=vertical && rows && sh_dovi_reference_el_vertical(sh,data,image,c,packed_rows) &&
                 pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=vertical));
             pl_dispatch_abort(pass->rr->dp,&sh);
             if (!ok) return false;
@@ -1895,7 +1901,7 @@ static bool pass_read_dovi_reference(struct pass_state *pass)
         if(!fmt)return false;
         planes[c]=get_fbo(pass,c?w/2:w,c?h/2:h,fmt,data->contract==2?1:c?2:1,PL_DEBUG_TAG);
         pl_shader sh=pl_dispatch_begin(pass->rr->dp);
-        bool ok=planes[c] && skip_reference_chroma_rows(pass,sh) &&
+        bool ok=planes[c] && skip_reference_rows(pass,sh,2) &&
             sh_dovi_reference_grid(sh,data,image,c,vertical,&pass->rr->cb1_mmr_state) &&
             pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=planes[c]));
         pl_dispatch_abort(pass->rr->dp,&sh);
@@ -1910,7 +1916,7 @@ static bool pass_read_dovi_reference(struct pass_state *pass)
     if (!fmt) return false;
     pl_tex chroma=get_fbo(pass,w/2,paired?h/2:h,fmt,2,PL_DEBUG_TAG);
     pl_shader sh=pl_dispatch_begin(pass->rr->dp);
-    bool ok=chroma && (paired?skip_reference_chroma_rows(pass,sh):skip_inactive_rows(pass,sh,h,false)) &&
+    bool ok=chroma && (paired?skip_reference_rows(pass,sh,2):skip_inactive_rows(pass,sh,h,false)) &&
         sh_dovi_reference_chroma(sh,planes[1],data->output_depth,top_left,paired) &&
         pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=chroma));
     pl_dispatch_abort(pass->rr->dp,&sh);
@@ -3019,6 +3025,30 @@ static void translate_srgb_color(float out_color[3], const float in_color[3],
     pl_color_delinearize(csp, out_color);
 }
 
+static bool cb1_dispatch_host_frame(pl_renderer rr, pl_shader *mapped, pl_tex target,
+                                    pl_buf buffer)
+{
+    int w=target->params.w,h=target->params.h;
+    pl_shader sh=pl_dispatch_begin_ex(rr->dp,true);
+    if(!sh_require(sh,PL_SHADER_SIG_NONE,0,0)){
+        pl_dispatch_abort(rr->dp,&sh);
+        return false;
+    }
+    struct pl_buffer_var data={.var=pl_var_vec4("cb1_linear")};
+    data.var.dim_a=w*h;
+    data.layout=pl_std430_layout(0,&data.var);
+    ident_t bind=sh_desc(sh,(struct pl_shader_desc){
+        .desc={.name="cb1_frame_data",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_WRITEONLY},
+        .binding={.object=buffer},.buffer_vars=&data,.num_buffer_vars=1});
+    ident_t pixel=sh_subpass(sh,*mapped);
+    pl_dispatch_abort(rr->dp,mapped);
+    if(!bind || !pixel){pl_dispatch_abort(rr->dp,&sh);return false;}
+    sh->output=PL_SHADER_SIG_COLOR;
+    GLSL("ivec2 pos=ivec2(gl_FragCoord.xy);cb1_linear[pos.y*%d+pos.x]="$"();"
+         "vec4 color=vec4(0.0);\n",w,pixel);
+    return pl_dispatch_finish(rr->dp,pl_dispatch_params(.shader=&sh,.target=target));
+}
+
 static bool pass_output_target(struct pass_state *pass)
 {
     const struct pl_render_params *params = pass->params;
@@ -3030,6 +3060,16 @@ static bool pass_output_target(struct pass_state *pass)
     struct img *img = &pass->img;
 
     bool need_clear = pl_frame_is_cropped(target);
+    if (params->cb1_lldv_host) {
+        const pl_buf buf = params->cb1_lldv_host;
+        const pl_tex tex = target->planes[0].texture;
+        if (!params->cb1_dovi_reference || target->num_planes != 1 ||
+            !tex || tex->params.w != 3840 || tex->params.h != 2160 ||
+            target->planes[0].flipped || target->num_overlays || need_clear ||
+            pass->rotation || params->blend_params || !buf->params.storable ||
+            !buf->data || buf->params.size < 3840ULL * 2160 * 16)
+            return false;
+    }
     pl_tex border_tex = NULL;
     if (need_clear && params->border == PL_CLEAR_BLUR &&
         !(rr->errors & PL_RENDER_ERR_BLUR))
@@ -3358,7 +3398,7 @@ static bool pass_output_target(struct pass_state *pass)
         const int sample_depth = PL_DEF(target->repr.bits.sample_depth,
                                         target->repr.bits.color_depth);
 
-        if (sample_depth && type != PL_FMT_FLOAT) {
+        if (!params->cb1_lldv_host && sample_depth && type != PL_FMT_FLOAT) {
             const char *comps = params->blend_params ? "rgb" : "rgba";
             const int bit_shift = target->repr.bits.bit_shift;
 
@@ -3395,12 +3435,14 @@ static bool pass_output_target(struct pass_state *pass)
             tscale.c[1] += plane->texture->params.h;
         }
 
-        bool ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
-            .shader = &sh,
-            .target = plane->texture,
-            .blend_params = params->blend_params,
-            .rect = plane_rect,
-        ));
+        bool ok = params->cb1_lldv_host ?
+            cb1_dispatch_host_frame(rr, &sh, plane->texture, params->cb1_lldv_host) :
+            pl_dispatch_finish(rr->dp, pl_dispatch_params(
+                .shader = &sh,
+                .target = plane->texture,
+                .blend_params = params->blend_params,
+                .rect = plane_rect,
+            ));
 
         if (!ok)
             return false;

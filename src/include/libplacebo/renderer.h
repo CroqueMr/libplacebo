@@ -382,6 +382,10 @@ struct pl_render_params {
     // Per-picture integer reference. Null preserves existing composition.
     const struct pl_cb1_dovi_reference *cb1_dovi_reference;
 
+#define PL_HAVE_CB1_LLDV_HOST 1
+    // Optional coherent RGBA32F storage output for a full 4K player-led image.
+    pl_buf cb1_lldv_host;
+
 
     // If this is true, all shaders will be generated as "dynamic" shaders,
     // with any compile-time constants being replaced by runtime-adjustable

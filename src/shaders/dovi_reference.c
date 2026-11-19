@@ -310,49 +310,76 @@ static bool reference_planes(pl_shader sh, const struct pl_frame *frame,
     return raw[0] && raw[1] && raw[2];
 }
 
-static ident_t reference_el_vertical(pl_shader sh, ident_t raw, bool chroma)
+static ident_t reference_el_vertical(pl_shader sh, ident_t raw, bool chroma, bool packed_rows)
 {
-    ident_t vertical = sh_fresh(sh,"ref_el_vertical");
-    if (chroma) {
-        GLSLH("int "$"(ivec2 p){int y=p.y/2;int s=(p.y&1)==0?"
-              "64*"$"(ivec2(p.x,y-1))+192*"$"(ivec2(p.x,y)):"
-              "192*"$"(ivec2(p.x,y))+64*"$"(ivec2(p.x,y+1));"
-              "return clamp((s+128)>>8,0,65535);}\n",vertical,raw,raw,raw,raw);
+    static const int luma[2][5]={{-3,29,111,-9,0},{0,-9,111,29,-3}};
+    static const int uv[2][5]={{0,64,192,0,0},{0,0,192,64,0}};
+    const int (*weights)[5]=chroma?uv:luma;
+    const int shift=chroma?8:7, bias=1<<(shift-1);
+    ident_t vertical=sh_fresh(sh,"ref_el_vertical");
+    GLSLH("int "$"(ivec2 p){\n",vertical);
+    if (packed_rows) {
+        // Read each shared tap once and store the two phases exactly in FP32.
+        // For 10-bit samples the luma peak is (140 * 1023 + 64) >> 7 = 1119.
+        for (int i=0;i<5;i++)
+            if (weights[0][i] || weights[1][i])
+                GLSLH("int t%d="$"(p+ivec2(0,%d));\n",i,raw,i-2);
+        GLSLH("int s[2];\n");
+        for (int phase=0;phase<2;phase++) {
+            GLSLH("s[%d]=max(0,(%d",phase,bias);
+            for (int i=0;i<5;i++)
+                if (weights[phase][i]) GLSLH("+(%d)*t%d",weights[phase][i],i);
+            GLSLH(")>>%d);\n",shift);
+        }
+        GLSLH("return s[0]|(s[1]<<11);}\n");
     } else {
-        GLSLH("int "$"(ivec2 p){int y=p.y/2;int s=(p.y&1)==0?"
-              "-3*"$"(ivec2(p.x,y-2))+29*"$"(ivec2(p.x,y-1))+111*"$"(ivec2(p.x,y))-9*"$"(ivec2(p.x,y+1)):"
-              "-9*"$"(ivec2(p.x,y-1))+111*"$"(ivec2(p.x,y))+29*"$"(ivec2(p.x,y+1))-3*"$"(ivec2(p.x,y+2));"
-              "return clamp((s+64)>>7,0,65535);}\n",vertical,raw,raw,raw,raw,raw,raw,raw,raw);
+        GLSLH("int y=p.y/2;int s=(p.y&1)==0?");
+        for (int phase=0;phase<2;phase++) {
+            GLSLH("%s(%d",phase?":":"",bias);
+            for (int i=0;i<5;i++)
+                if (weights[phase][i])
+                    GLSLH("+(%d)*"$"(ivec2(p.x,y+%d))",weights[phase][i],raw,i-2);
+            GLSLH(")");
+        }
+        GLSLH(";return clamp(s>>%d,0,65535);}\n",shift);
     }
     return vertical;
 }
 
 bool sh_dovi_reference_el_vertical(pl_shader sh, const struct pl_cb1_dovi_reference *data,
-                                   const struct pl_frame *image, bool chroma)
+                                   const struct pl_frame *image, bool chroma, bool packed_rows)
 {
     return data && data->residual && image && image->enhancement_layer &&
-        sh_dovi_fel_vertical(sh,image->enhancement_layer,data->el_depth,chroma);
+        sh_dovi_fel_vertical(sh,image->enhancement_layer,data->el_depth,chroma,packed_rows);
 }
 
-bool sh_dovi_fel_vertical(pl_shader sh,const struct pl_frame *el,unsigned depth,bool chroma)
+bool sh_dovi_fel_vertical(pl_shader sh,const struct pl_frame *el,unsigned depth,
+                          bool chroma,bool packed_rows)
 {
     if (!el || !sh_require(sh,PL_SHADER_SIG_NONE,0,0)) return false;
     ident_t raw[3]={0};
     if (!reference_planes(sh,el,depth,raw,false)) return false;
     GLSL("vec4 color=vec4(0.0,0.0,0.0,1.0);\n");
     for (int c=chroma?1:0;c<(chroma?3:1);c++) {
-        ident_t vertical=reference_el_vertical(sh,raw[c],chroma);
+        ident_t vertical=reference_el_vertical(sh,raw[c],chroma,packed_rows);
         GLSL("color[%d]=float("$"(ivec2(gl_FragCoord.xy)));\n",chroma?c-1:0,vertical);
     }
     return true;
 }
 
-static ident_t reference_el_horizontal(pl_shader sh, pl_tex texture, ident_t sampler, int lane, bool paired)
+static ident_t reference_el_horizontal(pl_shader sh, pl_tex texture, ident_t sampler, int lane, bool paired, bool packed_rows)
 {
     ident_t vertical=sh_fresh(sh,"ref_el_cached");
-    GLSLH("int "$"(ivec2 p){p=clamp(p,ivec2(0),ivec2(%d,%d));"
-          "return int(texelFetch("$",p,0)[%d]);}\n",
-          vertical,texture->params.w-1,texture->params.h-1,sampler,lane);
+    if (packed_rows) {
+        GLSLH("int "$"(ivec2 p){p=clamp(p,ivec2(0),ivec2(%d,%d));"
+              "uint codes=uint(texelFetch("$",ivec2(p.x,p.y>>1),0)[%d]);"
+              "return int((codes>>uint(11*(p.y&1)))&2047u);}\n",
+              vertical,texture->params.w-1,2*texture->params.h-1,sampler,lane);
+    } else {
+        GLSLH("int "$"(ivec2 p){p=clamp(p,ivec2(0),ivec2(%d,%d));"
+              "return int(texelFetch("$",p,0)[%d]);}\n",
+              vertical,texture->params.w-1,texture->params.h-1,sampler,lane);
+    }
     ident_t horizontal = sh_fresh(sh,"ref_el_horizontal");
     GLSLH("int "$"(ivec2 p){int x=p.x/2;if((p.x&1)==0)return "$"(ivec2(x,p.y));int s=0;\n",horizontal,vertical);
     const int weights[8] = {22,94,-524,2456,2456,-524,94,22};
@@ -373,7 +400,7 @@ bool sh_dovi_fel_horizontal(pl_shader sh,pl_tex vertical,unsigned depth,bool chr
     if (!sampler) return false;
     GLSL("vec4 color=vec4(0.0,0.0,0.0,1.0);\n");
     for(int c=0;c<(chroma?2:1);c++){
-        ident_t sample=reference_el_horizontal(sh,vertical,sampler,c,false);
+        ident_t sample=reference_el_horizontal(sh,vertical,sampler,c,false,false);
         GLSL("color[%d]=float("$"(ivec2(gl_FragCoord.xy)))/%u.0;\n",c,sample,(1u<<depth)-1);
     }
     return true;
@@ -450,8 +477,11 @@ static bool reference_grid(pl_shader sh, const struct pl_cb1_dovi_reference *dat
             ident_t sampler=sh_bind(sh,vertical,PL_TEX_ADDRESS_CLAMP,PL_TEX_SAMPLE_NEAREST,
                                     "ref_el_vertical",NULL,NULL,NULL);
             if (!sampler) return false;
+            // A texture at source height stores both row phases in each texel.
+            bool packed_rows=vertical->params.h==enhancement->crop.y1/(chroma?2:1);
             for (int c=chroma?1:0;c<(chroma?3:1);c++) {
-                el[c]=reference_el_horizontal(sh,vertical,sampler,chroma?c-1:0,data->contract==2);
+                el[c]=reference_el_horizontal(sh,vertical,sampler,chroma?c-1:0,
+                                               data->contract==2,packed_rows);
             }
         }
     }
