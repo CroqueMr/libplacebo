@@ -41,6 +41,12 @@ PL_API void pl_shader_set_alpha(pl_shader sh, struct pl_color_repr *repr,
 // automatically by `pl_shader_decode_color` for PL_COLOR_SYSTEM_DOLBYVISION.
 PL_API void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data);
 
+// Reconstruct normalized opponent components, without display-management color
+// conversion. Caller owns their representation and subsequent transport.
+#define PL_HAVE_CB1_DOVI_TRANSPORT 1
+PL_API void pl_shader_dovi_reconstruct(pl_shader sh, struct pl_color_repr *repr,
+                                        pl_shader enhancement_layer);
+
 // Arguments for the `pl_shader_decode_color_ex` call.
 struct pl_color_decode_args {
     // Input color representation. Mutated to reflect the decode. Required.

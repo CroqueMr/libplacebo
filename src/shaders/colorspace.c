@@ -90,7 +90,7 @@ static inline void reshape_mmr(pl_shader sh, ident_t mmr, bool single,
 
     assert(min_order <= max_order);
     if (min_order < max_order)
-        GLSL("uint order = uint(coeffs.w); \n");
+        GLSL("int order = int(coeffs.w); \n");
 
     GLSL("vec4 sigX;                            \n"
          "s = coeffs.x;                         \n"
@@ -130,6 +130,40 @@ static inline void reshape_mmr(pl_shader sh, ident_t mmr, bool single,
 static inline void reshape_poly(pl_shader sh)
 {
     GLSL("s = (coeffs.z * s + coeffs.y) * s + coeffs.x; \n");
+}
+
+static bool reshape_univariate_mmr(pl_shader sh, const struct pl_reshape_data *comp,
+                                  int channel)
+{
+    if (comp->num_pivots != 2 || comp->method[0] != 1 ||
+        comp->mmr_order[0] < 1 || comp->mmr_order[0] > 3)
+        return false;
+    for (int order = 0; order < comp->mmr_order[0]; order++) {
+        for (int term = 0; term < 7; term++) {
+            if (term != channel && comp->mmr_coeffs[0][order][term] != 0.0f)
+                return false;
+        }
+    }
+
+    float values[4] = {comp->mmr_constant[0]};
+    for (int order = 0; order < comp->mmr_order[0]; order++)
+        values[order + 1] = comp->mmr_coeffs[0][order][channel];
+    ident_t coeff = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_vec4("univariate_mmr"), .data = values,
+    });
+    float bounds[2] = {comp->pivots[0], comp->pivots[1]};
+    ident_t limits = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_vec2("univariate_bounds"), .data = bounds,
+    });
+    // Preserve order-by-order accumulation, not a Horner polynomial rewrite.
+    GLSL("{ float x = sig[%d]; s = "$".x; s += "$".y * x; \n",
+         channel, coeff, coeff);
+    if (comp->mmr_order[0] >= 2)
+        GLSL("float x2 = x * x; s += "$".z * x2; \n", coeff);
+    if (comp->mmr_order[0] >= 3)
+        GLSL("s += "$".w * (x2 * x); \n", coeff);
+    GLSL("color[%d] = clamp(s, "$".x, "$".y); } \n", channel, limits, limits);
+    return true;
 }
 #endif
 
@@ -204,6 +238,42 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
             continue;
 
         pl_assert(comp->num_pivots >= 2 && comp->num_pivots <= 9);
+        struct pl_reshape_data compact;
+        bool polynomial = comp->num_pivots > 2;
+        for (int i = 0; polynomial && i < comp->num_pivots - 1; i++)
+            polynomial = comp->method[i] == 0;
+        if (polynomial) {
+            compact = *comp;
+            int segments = 1;
+            for (int i = 1; i < comp->num_pivots - 1; i++) {
+                // Adjacent bit-identical polynomials share one interval.
+                if (!memcmp(comp->poly_coeffs[i], compact.poly_coeffs[segments - 1],
+                            sizeof(comp->poly_coeffs[i])))
+                    continue;
+                compact.pivots[segments] = comp->pivots[i];
+                memcpy(compact.poly_coeffs[segments], comp->poly_coeffs[i],
+                       sizeof(comp->poly_coeffs[i]));
+                segments++;
+            }
+            compact.pivots[segments] = comp->pivots[comp->num_pivots - 1];
+            compact.num_pivots = segments + 1;
+            comp = &compact;
+        }
+        // Identity segments need no coefficient selection or polynomial evaluation.
+        bool identity = comp->pivots[0] == 0.0f &&
+                        comp->pivots[comp->num_pivots - 1] == 1.0f;
+        for (int i = 0; identity && i < comp->num_pivots - 1; i++) {
+            identity = comp->method[i] == 0 &&
+                       comp->poly_coeffs[i][0] == 0.0f &&
+                       comp->poly_coeffs[i][1] == 1.0f &&
+                       comp->poly_coeffs[i][2] == 0.0f;
+        }
+        if (identity) {
+            GLSL("color[%d] = sig[%d]; \n", c, c);
+            continue;
+        }
+        if (reshape_univariate_mmr(sh, comp, c))
+            continue;
         GLSL("s = sig[%d]; \n", c);
 
         // Prepare coefficients for GPU
@@ -280,19 +350,24 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
                 },
             });
 
-            // Efficiently branch into the correct set of coefficients
-            GLSL("#define test(i) bvec4(s >= "$"[i])                \n"
-                 "#define coef(i) "$"[i]                            \n"
-                 "coeffs = mix(mix(mix(coef(0), coef(1), test(0)),  \n"
-                 "                 mix(coef(2), coef(3), test(2)),  \n"
-                 "                 test(1)),                        \n"
-                 "             mix(mix(coef(4), coef(5), test(4)),  \n"
-                 "                 mix(coef(6), coef(7), test(6)),  \n"
-                 "                 test(5)),                        \n"
-                 "             test(3));                            \n"
-                 "#undef test                                       \n"
-                 "#undef coef                                       \n",
-                 pivots, coeffs);
+            if (comp->num_pivots <= 4) {
+                GLSL("coeffs = mix("$"[0], "$"[1], bvec4(s >= "$"[0])); \n",
+                     coeffs, coeffs, pivots);
+                if (comp->num_pivots == 4)
+                    GLSL("coeffs = mix(coeffs, "$"[2], bvec4(s >= "$"[1])); \n",
+                         coeffs, pivots);
+            } else {
+                // Select one segment with three comparisons instead of seven vec4 mixes.
+                GLSL("{                                                \n"
+                 "#define pivot(i) "$"[i]                          \n"
+                 "int segment = int(s >= pivot(3)) * 4;             \n"
+                 "segment += int(s >= pivot(segment + 1)) * 2;      \n"
+                 "segment += int(s >= pivot(segment));              \n"
+                 "coeffs = "$"[segment];                           \n"
+                 "#undef pivot                                      \n"
+                 "}                                                 \n",
+                     pivots, coeffs);
+            }
 
         } else {
 
@@ -350,36 +425,37 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
 #endif
 }
 
+void pl_shader_dovi_reconstruct(pl_shader sh, struct pl_color_repr *repr,
+                                 pl_shader enhancement_layer)
+{
+    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
+        return;
+    if (!repr || repr->sys != PL_COLOR_SYSTEM_DOLBYVISION || !repr->dovi) {
+        SH_FAIL(sh, "DOVI reconstruction requires source representation and metadata");
+        return;
+    }
+    ident_t scale = SH_FLOAT(pl_color_repr_normalize(repr));
+    GLSL("color.rgb *= vec3("$"); \n", scale);
+    pl_shader_dovi_reshape(sh, repr->dovi);
+    if (enhancement_layer && repr->dovi->nlq_active) {
+        ident_t el = sh_subpass(sh, enhancement_layer);
+        if (el)
+            sh_dovi_compose_nlq(sh, repr->dovi, el);
+    }
+}
+
 void pl_shader_decode_color_ex(pl_shader sh,
                                const struct pl_color_decode_args *args)
 {
     struct pl_color_repr *repr = args->repr;
     const struct pl_color_adjustment *params = args->color_adjustment;
-
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
-
     sh_describe(sh, "color decoding");
     GLSL("// pl_shader_decode_color \n"
          "{ \n");
-
     if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
-    {
-        ident_t scale = SH_FLOAT(pl_color_repr_normalize(repr));
-        GLSL("color.rgb *= vec3("$"); \n", scale);
-    }
-
-    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
-        pl_shader_dovi_reshape(sh, repr->dovi);
-
-    // Dolby Vision FEL composition
-    if (args->enhancement_layer && repr->sys == PL_COLOR_SYSTEM_DOLBYVISION &&
-        repr->dovi && repr->dovi->nlq_active)
-    {
-        ident_t el = sh_subpass(sh, args->enhancement_layer);
-        if (el)
-            sh_dovi_compose_nlq(sh, repr->dovi, el);
-    }
+        pl_shader_dovi_reconstruct(sh, repr, args->enhancement_layer);
 
     enum pl_color_system orig_sys = repr->sys;
     pl_transform3x3 tr = pl_color_repr_decode(repr, params);

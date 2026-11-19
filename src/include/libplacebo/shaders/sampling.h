@@ -168,6 +168,10 @@ struct pl_sample_filter_params {
     // CB policy-only orthogonal LUT FLOAT4 depth32 LINEAR format, default off.
     // Requires matched CB-patched headers/library. No polar-path change.
     bool cb1_fp32_lut;
+    // Opt-in cache for the validated native transport interpolation behavior.
+    bool cb1_exact_lut_cache;
+    // Exact 2x centered taps; caller validates fragment quad support.
+    bool cb1_quad_scaler;
 
 
     // This shader object is used to store the LUT, and will be recreated

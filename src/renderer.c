@@ -343,6 +343,7 @@ struct pass_state {
     pl_renderer rr;
     const struct pl_render_params *params;
     struct pl_render_info info; // for info callback
+    float cb1_active_rows[2];
 
     // Represents the "current" image which we're in the process of rendering.
     // This is initially set by pass_read_image, and all of the subsequent
@@ -690,11 +691,35 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
     return info;
 }
 
+static bool skip_inactive_rows(struct pass_state *pass, pl_shader sh, int height, bool target_coordinates)
+{
+    if (height != 2160 || pass->cb1_active_rows[1] <= pass->cb1_active_rows[0])
+        return true;
+    enum pl_shader_sig signature = sh->output;
+    if (!sh_require(sh, signature, 0, 0))
+        return false;
+    sh->output = signature;
+    float bounds[2] = {pass->cb1_active_rows[0], pass->cb1_active_rows[1]};
+    if (target_coordinates && pass->target.planes[0].flipped) {
+        bounds[0] = 2160-pass->cb1_active_rows[1];
+        bounds[1] = 2160-pass->cb1_active_rows[0];
+    }
+    ident_t rows = sh_var(sh, (struct pl_shader_var) {
+        .var = pl_var_vec2("cb1_active_rows"),
+        .data = bounds, .dynamic = true,
+    });
+    GLSL("if(gl_FragCoord.y < "$".x || gl_FragCoord.y >= "$".y) "
+         "return vec4(0.0,0.0,0.0,1.0);\n", rows, rows);
+    return true;
+}
+
 static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
                              struct sampler *sampler, enum sampler_usage usage,
                              pl_tex target_tex, const struct pl_sample_src *src)
 {
     const struct pl_render_params *params = pass->params;
+    if (usage == SAMPLER_PLANE && !skip_inactive_rows(pass, sh, src->new_h, true))
+        return;
     if (!sampler)
         goto fallback;
 
@@ -747,10 +772,12 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
 
     pl_assert(lut);
     struct pl_sample_filter_params fparams = {
+        .cb1_quad_scaler = params->cb1_quad_scaler,
         .filter      = *info.config,
         .antiring    = params->antiringing_strength,
         .no_widening = params->skip_anti_aliasing && usage != SAMPLER_LOWPASS,
         .cb1_fp32_lut = params->cb1_fp32_scaler_lut,
+        .cb1_exact_lut_cache = params->cb1_dovi_transport && params->cb1_exact_scaler_cache,
         .lut         = lut,
     };
 
@@ -774,6 +801,11 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
         src2.rect.y1 = src1.new_h;
 
         pl_shader tsh = pl_dispatch_begin(rr->dp);
+        if (usage == SAMPLER_PLANE && !skip_inactive_rows(pass, tsh, src1.new_h, false)) {
+            pl_dispatch_abort(rr->dp, &tsh);
+            ok = false;
+            goto done;
+        }
         ok = pl_shader_sample_ortho2(tsh, &src1, &fparams);
         if (!ok) {
             pl_dispatch_abort(rr->dp, &tsh);
@@ -2096,11 +2128,18 @@ static bool pass_read_image(struct pass_state *pass)
             }
         }
 #endif
-        pl_shader_decode_color_ex(sh, pl_color_decode_args(
-            .repr              = &pass->img.repr,
-            .color_adjustment  = params->color_adjustment,
-            .enhancement_layer = el_sh,
-        ));
+        if (params->cb1_dovi_transport) {
+            pl_shader_dovi_reconstruct(sh, &pass->img.repr, el_sh);
+            // Internal carrier only. The output hook owns opponent encoding.
+            pass->img.repr.sys = PL_COLOR_SYSTEM_RGB;
+            pass->img.repr.levels = PL_COLOR_LEVELS_FULL;
+        } else {
+            pl_shader_decode_color_ex(sh, pl_color_decode_args(
+                .repr              = &pass->img.repr,
+                .color_adjustment  = params->color_adjustment,
+                .enhancement_layer = el_sh,
+            ));
+        }
         pl_dispatch_abort(rr->dp, &el_sh);
     }
 
@@ -2319,6 +2358,8 @@ error:
 static void pass_convert_colors(struct pass_state *pass)
 {
     const struct pl_render_params *params = pass->params;
+    if (params->cb1_dovi_transport)
+        return;
     const struct pl_frame *image = &pass->image;
     const struct pl_frame *target = &pass->target;
     pl_renderer rr = pass->rr;
@@ -3641,9 +3682,9 @@ done:
     return true;
 }
 
-bool pl_render_image(pl_renderer rr, const struct pl_frame *pimage,
+static bool render_image(pl_renderer rr, const struct pl_frame *pimage,
                      const struct pl_frame *ptarget,
-                     const struct pl_render_params *params)
+                     const struct pl_render_params *params, int active_y0, int active_y1)
 {
     params = PL_DEF(params, &pl_render_default_params);
     pl_dispatch_mark_dynamic(rr->dp, params->dynamic_constants);
@@ -3657,6 +3698,7 @@ bool pl_render_image(pl_renderer rr, const struct pl_frame *pimage,
         .image = *pimage,
         .target = *ptarget,
         .info.stage = PL_RENDER_STAGE_FRAME,
+        .cb1_active_rows = {active_y0, active_y1},
     };
 
     if (!pass_init(&pass, true))
@@ -3684,6 +3726,27 @@ error:
     PL_ERR(rr, "Failed rendering image!");
     pass_uninit(&pass);
     return false;
+}
+
+bool pl_render_image(pl_renderer rr, const struct pl_frame *image,
+                     const struct pl_frame *target, const struct pl_render_params *params)
+{
+    return render_image(rr, image, target, params, 0, 0);
+}
+
+bool pl_render_image_cb1_active_rows(pl_renderer rr, const struct pl_frame *image,
+                     const struct pl_frame *target, const struct pl_render_params *params,
+                     int active_y0, int active_y1)
+{
+    if (!image || !target || image->rotation || target->rotation ||
+        image->num_overlays || target->num_overlays ||
+        image->crop.x0 || image->crop.y0 || image->crop.x1 != 3840 || image->crop.y1 != 2160 ||
+        target->crop.x0 || target->crop.y0 || target->crop.x1 != 3840 || target->crop.y1 != 2160 ||
+        target->num_planes != 1 || !target->planes[0].texture ||
+        target->planes[0].texture->params.w != 3840 || target->planes[0].texture->params.h != 2160 ||
+        active_y0 < 0 || active_y1 > 2160 || active_y0 >= active_y1)
+        return false;
+    return render_image(rr, image, target, params, active_y0, active_y1);
 }
 
 const struct pl_frame *pl_frame_mix_current(const struct pl_frame_mix *mix)

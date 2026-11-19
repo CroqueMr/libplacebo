@@ -358,6 +358,14 @@ struct pl_render_params {
     // CB policy opt-in: colour management consumes the current hook domain.
     // Default false retains original source-domain handling. Matched ABI only.
     bool cb1_hook_color_space;
+    // Exact 2x centered taps; caller validates fragment quad support.
+    bool cb1_quad_scaler;
+    // CB native transport opt-in. Reconstruct opponent components instead of
+    // RGB; a caller-provided output hook packs them with matching DM matrices.
+    // Requires 1:1 geometry, no color operations/overlays and matched headers.
+    bool cb1_dovi_transport;
+    // Exact native transport sampler cache, default off. Validated GPU only.
+    bool cb1_exact_scaler_cache;
 
 
     // If this is true, all shaders will be generated as "dynamic" shaders,
@@ -758,6 +766,14 @@ PL_API void pl_frames_infer(pl_renderer rr, struct pl_frame *image,
 PL_API bool pl_render_image(pl_renderer rr, const struct pl_frame *image,
                             const struct pl_frame *target,
                             const struct pl_render_params *params);
+
+// CB1 full-raster 4K transport only. The output hook must replace all rows
+// outside [active_y0, active_y1), including any subtitle/background composition.
+// Intermediate separable plane scalers may omit those rows. Active filtering
+// and the ordinary pl_render_image path are unchanged.
+PL_API bool pl_render_image_cb1_active_rows(pl_renderer rr, const struct pl_frame *image,
+                            const struct pl_frame *target,
+                            const struct pl_render_params *params, int active_y0, int active_y1);
 
 // Flushes the internal state of this renderer. This is normally not needed,
 // even if the image parameters, colorspace or target configuration change,
