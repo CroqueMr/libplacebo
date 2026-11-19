@@ -344,6 +344,12 @@ struct pl_render_params {
     // A value of 32 requires floating-point intermediates without a lower-depth fallback.
     int min_fbo_precision;
 
+    // CB policy opt-in: aligned, exact 1:1 plane/main sampling uses the
+    // existing nearest sampler instead of automatic bilinear sampling.
+    // Default false preserves all existing callers. Requires matching
+    // CB-patched headers and library; this is not an upstream ABI field.
+    bool cb1_nearest_identity;
+
     // If this is true, all shaders will be generated as "dynamic" shaders,
     // with any compile-time constants being replaced by runtime-adjustable
     // values. This is generally a performance loss, but has the advantage of

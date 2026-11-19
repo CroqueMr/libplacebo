@@ -703,6 +703,17 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
     pl_shader_obj *lut = NULL;
     switch (info.dir) {
     case SAMPLER_NOOP:
+        if (params->cb1_nearest_identity &&
+            src->new_w == fabsf(pl_rect_w(src->rect)) &&
+            src->new_h == fabsf(pl_rect_h(src->rect)) &&
+            src->rect.x0 == floorf(src->rect.x0) &&
+            src->rect.y0 == floorf(src->rect.y0) &&
+            src->rect.x1 == floorf(src->rect.x1) &&
+            src->rect.y1 == floorf(src->rect.y1))
+        {
+            pl_shader_sample_nearest(sh, src);
+            return;
+        }
         goto fallback;
     case SAMPLER_DOWN:
         lut = &sampler->downscaler_state;
