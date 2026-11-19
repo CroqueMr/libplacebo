@@ -1942,9 +1942,17 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         } else {
 
             pl_assert(obj);
+            pl_fmt tone_fmt = params->cb1_fp32_tone_lut ?
+                pl_find_fmt(SH_GPU(sh), PL_FMT_FLOAT, 1, 32, 32,
+                            PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR) : NULL;
+            if (params->cb1_fp32_tone_lut && !tone_fmt) {
+                SH_FAIL(sh, "CB policy requires FP32 linear tone-LUT storage!");
+                return;
+            }
             ident_t lut = sh_lut(sh, sh_lut_params(
                 .object     = &obj->tone.lut,
                 .var_type   = PL_VAR_FLOAT,
+                .fmt        = tone_fmt,
                 .lut_type   = SH_LUT_AUTO,
                 .method     = SH_LUT_LINEAR,
                 .width      = tone.lut_size,

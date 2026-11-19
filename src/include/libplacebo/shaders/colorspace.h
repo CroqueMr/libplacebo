@@ -309,6 +309,12 @@ struct pl_color_map_params {
     // faster pure GLSL replacements (e.g. clip, linear, saturation).
     bool force_tone_mapping_lut;
 
+    // CB policy opt-in: require actual FP32 tone-LUT storage. Default false
+    // preserves existing callers' automatic format selection. This changes
+    // storage precision only, not the curve or lookup operator. Requires
+    // matching CB-patched headers/library; this is not an upstream ABI field.
+    bool cb1_fp32_tone_lut;
+
     // Visualize the tone-mapping LUT and gamut mapping 3DLUT, in IPT space.
     bool visualize_lut;
 
