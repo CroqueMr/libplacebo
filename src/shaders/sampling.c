@@ -947,6 +947,12 @@ enum {
     SEP_PASSES
 };
 
+pl_fmt pl_sample_filter_cb1_fp32_lut_format(pl_gpu gpu)
+{
+    return pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+                       PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR);
+}
+
 bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
                              const struct pl_sample_filter_params *params)
 {
@@ -1053,9 +1059,16 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
 
     int N = obj->filter->row_size; // number of samples to convolve
     int width = obj->filter->row_stride / 4; // width of the LUT texture
+    pl_fmt lut_fmt = params->cb1_fp32_lut ?
+        pl_sample_filter_cb1_fp32_lut_format(gpu) : NULL;
+    if (params->cb1_fp32_lut && !lut_fmt) {
+        SH_FAIL(sh, "CB policy requires FP32 linear orthogonal LUT storage!");
+        return false;
+    }
     ident_t lut = sh_lut(sh, sh_lut_params(
         .object     = &obj->lut,
         .var_type   = PL_VAR_FLOAT,
+        .fmt        = lut_fmt,
         .method     = SH_LUT_LINEAR,
         .width      = width,
         .height     = SCALER_LUT_SIZE,

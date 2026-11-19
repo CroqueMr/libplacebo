@@ -165,6 +165,10 @@ struct pl_sample_filter_params {
     bool no_compute;
     // Disable the use of filter widening / anti-aliasing (for downscaling)
     bool no_widening;
+    // CB policy-only orthogonal LUT FLOAT4 depth32 LINEAR format, default off.
+    // Requires matched CB-patched headers/library. No polar-path change.
+    bool cb1_fp32_lut;
+
 
     // This shader object is used to store the LUT, and will be recreated
     // if necessary. To avoid thrashing the resource, users should avoid trying
@@ -200,6 +204,11 @@ PL_API bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src
 // as well.
 PL_API bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
                                     const struct pl_sample_filter_params *params);
+
+// Exact format capability used by cb1_fp32_lut. NULL means unsupported;
+// the opted-in orthogonal sampler fails rather than using half precision.
+// This real lookup also identifies the matching CB sampling library ABI.
+PL_API pl_fmt pl_sample_filter_cb1_fp32_lut_format(pl_gpu gpu);
 
 struct pl_distort_params {
     // An arbitrary 2x2 affine transformation to apply to the input image.

@@ -750,6 +750,7 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
         .filter      = *info.config,
         .antiring    = params->antiringing_strength,
         .no_widening = params->skip_anti_aliasing && usage != SAMPLER_LOWPASS,
+        .cb1_fp32_lut = params->cb1_fp32_scaler_lut,
         .lut         = lut,
     };
 

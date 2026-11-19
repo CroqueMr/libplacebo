@@ -352,6 +352,10 @@ struct pl_render_params {
     // CB policy-only equivalent ST2084 FP32 realization, default off.
     // Requires matched renderer/shader/dispatch headers and library.
     bool cb1_stable_pq;
+    // CB policy-only orthogonal scaler-LUT FP32 storage, default off.
+    // Weights and sampling stay unchanged. Requires matched sampling ABI.
+    bool cb1_fp32_scaler_lut;
+
 
     // If this is true, all shaders will be generated as "dynamic" shaders,
     // with any compile-time constants being replaced by runtime-adjustable
