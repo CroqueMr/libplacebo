@@ -3025,6 +3025,30 @@ static void translate_srgb_color(float out_color[3], const float in_color[3],
     pl_color_delinearize(csp, out_color);
 }
 
+static bool cb1_dispatch_host_frame(pl_renderer rr, pl_shader *mapped, pl_tex target,
+                                    pl_buf buffer)
+{
+    int w=target->params.w,h=target->params.h;
+    pl_shader sh=pl_dispatch_begin_ex(rr->dp,true);
+    if(!sh_require(sh,PL_SHADER_SIG_NONE,0,0)){
+        pl_dispatch_abort(rr->dp,&sh);
+        return false;
+    }
+    struct pl_buffer_var data={.var=pl_var_vec4("cb1_linear")};
+    data.var.dim_a=w*h;
+    data.layout=pl_std430_layout(0,&data.var);
+    ident_t bind=sh_desc(sh,(struct pl_shader_desc){
+        .desc={.name="cb1_frame_data",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_WRITEONLY},
+        .binding={.object=buffer},.buffer_vars=&data,.num_buffer_vars=1});
+    ident_t pixel=sh_subpass(sh,*mapped);
+    pl_dispatch_abort(rr->dp,mapped);
+    if(!bind || !pixel){pl_dispatch_abort(rr->dp,&sh);return false;}
+    sh->output=PL_SHADER_SIG_COLOR;
+    GLSL("ivec2 pos=ivec2(gl_FragCoord.xy);cb1_linear[pos.y*%d+pos.x]="$"();"
+         "vec4 color=vec4(0.0);\n",w,pixel);
+    return pl_dispatch_finish(rr->dp,pl_dispatch_params(.shader=&sh,.target=target));
+}
+
 static bool pass_output_target(struct pass_state *pass)
 {
     const struct pl_render_params *params = pass->params;
@@ -3036,6 +3060,16 @@ static bool pass_output_target(struct pass_state *pass)
     struct img *img = &pass->img;
 
     bool need_clear = pl_frame_is_cropped(target);
+    if (params->cb1_lldv_host) {
+        const pl_buf buf = params->cb1_lldv_host;
+        const pl_tex tex = target->planes[0].texture;
+        if (!params->cb1_dovi_reference || target->num_planes != 1 ||
+            !tex || tex->params.w != 3840 || tex->params.h != 2160 ||
+            target->planes[0].flipped || target->num_overlays || need_clear ||
+            pass->rotation || params->blend_params || !buf->params.storable ||
+            !buf->data || buf->params.size < 3840ULL * 2160 * 16)
+            return false;
+    }
     pl_tex border_tex = NULL;
     if (need_clear && params->border == PL_CLEAR_BLUR &&
         !(rr->errors & PL_RENDER_ERR_BLUR))
@@ -3364,7 +3398,7 @@ static bool pass_output_target(struct pass_state *pass)
         const int sample_depth = PL_DEF(target->repr.bits.sample_depth,
                                         target->repr.bits.color_depth);
 
-        if (sample_depth && type != PL_FMT_FLOAT) {
+        if (!params->cb1_lldv_host && sample_depth && type != PL_FMT_FLOAT) {
             const char *comps = params->blend_params ? "rgb" : "rgba";
             const int bit_shift = target->repr.bits.bit_shift;
 
@@ -3401,12 +3435,14 @@ static bool pass_output_target(struct pass_state *pass)
             tscale.c[1] += plane->texture->params.h;
         }
 
-        bool ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
-            .shader = &sh,
-            .target = plane->texture,
-            .blend_params = params->blend_params,
-            .rect = plane_rect,
-        ));
+        bool ok = params->cb1_lldv_host ?
+            cb1_dispatch_host_frame(rr, &sh, plane->texture, params->cb1_lldv_host) :
+            pl_dispatch_finish(rr->dp, pl_dispatch_params(
+                .shader = &sh,
+                .target = plane->texture,
+                .blend_params = params->blend_params,
+                .rect = plane_rect,
+            ));
 
         if (!ok)
             return false;
