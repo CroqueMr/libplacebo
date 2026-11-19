@@ -355,6 +355,9 @@ struct pl_render_params {
     // CB policy-only orthogonal scaler-LUT FP32 storage, default off.
     // Weights and sampling stay unchanged. Requires matched sampling ABI.
     bool cb1_fp32_scaler_lut;
+    // CB policy opt-in: colour management consumes the current hook domain.
+    // Default false retains original source-domain handling. Matched ABI only.
+    bool cb1_hook_color_space;
 
 
     // If this is true, all shaders will be generated as "dynamic" shaders,

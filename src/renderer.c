@@ -2328,20 +2328,23 @@ static void pass_convert_colors(struct pass_state *pass)
 
     bool prelinearized = false;
     bool need_conversion = true;
-    assert(image->color.primaries == img->color.primaries);
+    const struct pl_color_space src_csp = params->cb1_hook_color_space
+                                       ? img->color : image->color;
+    if (!params->cb1_hook_color_space)
+        assert(image->color.primaries == img->color.primaries);
     if (img->color.transfer == PL_COLOR_TRC_LINEAR) {
         if (img->repr.alpha == PL_ALPHA_PREMULTIPLIED) {
             // Very annoying edge case: since prelinerization happens with
             // premultiplied alpha, but color mapping happens with independent
             // alpha, we need to go back to non-linear representation *before*
             // alpha mode conversion, to avoid distortion
-            img->color.transfer = image->color.transfer;
+            img->color.transfer = src_csp.transfer;
             pl_shader_delinearize(sh, &img->color);
         } else {
             prelinearized = true;
         }
-    } else if (img->color.transfer != image->color.transfer) {
-        if (image->color.transfer == PL_COLOR_TRC_LINEAR) {
+    } else if (img->color.transfer != src_csp.transfer) {
+        if (src_csp.transfer == PL_COLOR_TRC_LINEAR) {
             // Another annoying edge case: if the input is linear light, but we
             // decide to un-linearize it for scaling purposes, we need to
             // re-linearize before passing it into `pl_shader_color_map`
@@ -2422,7 +2425,7 @@ static void pass_convert_colors(struct pass_state *pass)
 
         // current -> target
         pl_shader_color_map_ex(sh, params->color_map_params, pl_color_map_args(
-            .src           = image->color,
+            .src           = src_csp,
             .dst           = target_csp,
             .prelinearized = prelinearized,
             .state         = &rr->tone_map_state,
