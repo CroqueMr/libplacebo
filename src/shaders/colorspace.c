@@ -138,14 +138,9 @@ void sh_dovi_compose_nlq(pl_shader sh, const struct pl_dovi_metadata *data,
     // pl_map_dovi_metadata, so the per-pixel form collapses to:
     //   residual = sign(el_centered) * (|el_centered| * slope + threshold)
     // sign(0) == 0 covers the spec's rr==0 carve-out exactly.
-    // Filtering/normalization can move a neutral sample by float roundoff.
-    // Do not turn a two-ULP cancellation error into a half-code residual.
 #pragma GLSL /* sh_dovi_compose_nlq */                                  \
     {                                                                   \
-    vec3 el_sample = $el_signal().rgb;                                \
-    vec3 el_centered = el_sample - $off;                              \
-    vec3 noise = 2.384185791015625e-7 * max(abs(el_sample), abs($off)); \
-    el_centered = mix(el_centered, vec3(0.0), lessThanEqual(abs(el_centered), noise)); \
+    vec3 el_centered = $el_signal().rgb - $off;                         \
     color.rgb += sign(el_centered) * (abs(el_centered) * $slp + $thr);  \
     }
 #endif
