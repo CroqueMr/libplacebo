@@ -67,6 +67,7 @@ struct pl_renderer_t {
     // Shader resource objects and intermediate textures (FBOs)
     pl_shader_obj tone_map_state;
     pl_shader_obj dither_state;
+    pl_shader_obj cb1_mmr_state;
     pl_shader_obj grain_state[4];
     pl_shader_obj lut_state[3];
     pl_shader_obj icc_state[2];
@@ -159,6 +160,7 @@ void pl_renderer_destroy(pl_renderer *p_rr)
     // Free all shader resource objects
     pl_shader_obj_destroy(&rr->tone_map_state);
     pl_shader_obj_destroy(&rr->dither_state);
+    pl_shader_obj_destroy(&rr->cb1_mmr_state);
     for (int i = 0; i < PL_ARRAY_SIZE(rr->lut_state); i++)
         pl_shader_obj_destroy(&rr->lut_state[i]);
     for (int i = 0; i < PL_ARRAY_SIZE(rr->grain_state); i++)
@@ -1620,11 +1622,67 @@ static bool want_merge(struct pass_state *pass,
 static int frame_ref(const struct pl_frame *frame);
 
 #ifdef PL_HAVE_DOVI
+// Reuse the reference EL filters without changing BL reconstruction.
+static bool prepare_reference_el(struct pass_state *pass, const struct pl_frame *el,
+                                 struct pl_frame *out)
+{
+    pl_renderer rr = pass->rr;
+    const pl_rect2df bl = pass->image.crop;
+    unsigned depth = el->repr.bits.color_depth;
+    if (bl.x0 || bl.y0 || !pl_cb1_dovi_reference_frame_supported(el, depth))
+        return false;
+    *out = *el;
+    int w = el->crop.x1, h = el->crop.y1;
+    if (w == bl.x1 && h == bl.y1)
+        return true;
+    if (w * 2 != bl.x1 || h * 2 != bl.y1 || w % 2 || h % 2)
+        return false;
+
+    out->num_planes = 2;
+    out->crop = (pl_rect2df) {0, 0, w * 2, h * 2};
+    out->repr.bits = (struct pl_bit_encoding) {.sample_depth=depth, .color_depth=depth};
+    for (int c = 0; c < 2; c++) {
+        pl_fmt fmt = pl_find_fmt(rr->gpu, PL_FMT_FLOAT, c ? 2 : 1, 32, 32,
+                                 PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR);
+        if (!fmt) return false;
+        pl_tex vertical = get_fbo(pass, c ? w/2 : w, c ? h : h*2, fmt, c ? 2 : 1, PL_DEBUG_TAG);
+        pl_shader sh = pl_dispatch_begin(rr->dp);
+        bool ok = vertical && sh_dovi_fel_vertical(sh, el, depth, c, false) &&
+            pl_dispatch_finish(rr->dp, pl_dispatch_params(.shader=&sh, .target=vertical));
+        pl_dispatch_abort(rr->dp, &sh);
+        if (!ok) return false;
+        pl_tex horizontal = get_fbo(pass, c ? w : w*2, c ? h : h*2, fmt, c ? 2 : 1, PL_DEBUG_TAG);
+        sh = pl_dispatch_begin(rr->dp);
+        ok = horizontal && sh_dovi_fel_horizontal(sh, vertical, depth, c) &&
+            pl_dispatch_finish(rr->dp, pl_dispatch_params(.shader=&sh, .target=horizontal));
+        pl_dispatch_abort(rr->dp, &sh);
+        if (!ok) return false;
+        const struct pl_plane *source = &el->planes[0];
+        for (int p = 0; p < el->num_planes; p++)
+            if (el->planes[p].component_mapping[0] == c)
+                source = &el->planes[p];
+        out->planes[c] = (struct pl_plane) {
+            .texture=horizontal, .components=c ? 2 : 1,
+            .component_mapping={c, c ? 2 : -1, -1, -1},
+            .shift_x=source->shift_x, .shift_y=source->shift_y,
+        };
+    }
+    return true;
+}
+
 // Build a sub-shader that samples the enhancement layer planes and returns
 // the (color-repr-normalized) EL signal.
 static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
 {
     pl_renderer rr = pass->rr;
+    struct pl_frame prepared;
+    if (pass->params->cb1_fel_filter == 2) {
+        if (!prepare_reference_el(pass, el, &prepared)) {
+            PL_ERR(rr, "Reference FEL filter: unsupported EL layout or enlargement");
+            return NULL;
+        }
+        el = &prepared;
+    }
     pl_shader sh = pl_dispatch_begin_ex(rr->dp, true);
     if (!sh_require(sh, PL_SHADER_SIG_NONE, 0, 0))
         return NULL;
@@ -1650,17 +1708,22 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
     }
 
     float layer_x = 0, layer_y = 0;
-    if (el_ref->params.w < ref_tex->params.w || el_ref->params.h < ref_tex->params.h) {
+    const bool reference_el = pass->params->cb1_fel_filter == 2;
+    float bl_w = reference_el ? bl_crop.x1 : ref_tex->params.w;
+    float bl_h = reference_el ? bl_crop.y1 : ref_tex->params.h;
+    float el_w = reference_el ? el->crop.x1 : el_ref->params.w;
+    float el_h = reference_el ? el->crop.y1 : el_ref->params.h;
+    if (el_w < bl_w || el_h < bl_h) {
         float lx, ly;
         pl_chroma_location_offset(PL_CHROMA_LEFT, &lx, &ly);
-        if (el_ref->params.w < ref_tex->params.w)
+        if (el_w < bl_w)
             layer_x = lx;
-        if (el_ref->params.h < ref_tex->params.h)
+        if (el_h < bl_h)
             layer_y = ly;
     }
 
-    float lrx = (float) el_ref->params.w / ref_tex->params.w,
-          lry = (float) el_ref->params.h / ref_tex->params.h;
+    float lrx = el_w / bl_w,
+          lry = el_h / bl_h;
     float rlx = lrx >= 1 ? roundf(lrx) : 1.0 / roundf(1.0 / lrx),
           rly = lry >= 1 ? roundf(lry) : 1.0 / roundf(1.0 / lry);
 
@@ -1707,8 +1770,17 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
         pl_shader plane_sh = pl_dispatch_begin_ex(rr->dp, true);
         enum sampler_usage usage = detect_plane_type(plane, &el->repr) == PLANE_CHROMA ?
                                    SAMPLER_CHROMA : SAMPLER_PLANE;
-        dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], usage,
-                         NULL, &src);
+        if (pass->params->cb1_fel_filter) {
+            if (plane->flipped) {
+                src.rect.y0 = plane->texture->params.h - src.rect.y0;
+                src.rect.y1 = plane->texture->params.h - src.rect.y1;
+            }
+            if (usage != SAMPLER_PLANE || skip_inactive_rows(pass, plane_sh, src.new_h, true))
+                pl_shader_sample_bilinear(plane_sh, &src);
+        } else {
+            dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], usage,
+                             NULL, &src);
+        }
 
         ident_t sub = sh_subpass(sh, plane_sh);
         pl_dispatch_abort(rr->dp, &plane_sh);
@@ -1731,9 +1803,145 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
 }
 #endif // PL_HAVE_DOVI
 
+unsigned pl_cb1_fel_filter_abi(void)
+{
+    return PL_CB1_FEL_FILTER_API;
+}
+
+static bool skip_reference_rows(struct pass_state *pass, pl_shader sh, int divisor)
+{
+    if (pass->cb1_active_rows[1]<=pass->cb1_active_rows[0]) return true;
+    float bounds[2]={floorf(pass->cb1_active_rows[0]/divisor)-4,
+                     ceilf(pass->cb1_active_rows[1]/divisor)+4};
+    enum pl_shader_sig signature=sh->output;
+    if (!sh_require(sh,signature,0,0)) return false;
+    sh->output=signature;
+    ident_t rows=sh_var(sh,(struct pl_shader_var){.var=pl_var_vec2("ref_active_rows"),
+                                               .data=bounds,.dynamic=true});
+    GLSL("if(gl_FragCoord.y < "$".x || gl_FragCoord.y >= "$".y) return vec4(0.0);\n",rows,rows);
+    return true;
+}
+
+static bool pass_read_dovi_reference(struct pass_state *pass)
+{
+    const struct pl_cb1_dovi_reference *data=pass->params->cb1_dovi_reference;
+    const struct pl_frame *image=&pass->image;
+    int w=image->crop.x1,h=image->crop.y1;
+    if (!pass->params->cb1_dovi_transport || image->icc || image->lut ||
+        pass->params->lut || pass->rotation || pl_rect_w(pass->target.crop)!=w ||
+        pl_rect_h(pass->target.crop)!=h || w<=0 || h<=0) return false;
+    pl_tex planes[2]={0};
+    if(pass->params->cb1_fast_chroma){
+        pl_fmt fmt=pl_find_fmt(pass->rr->gpu,PL_FMT_UNORM,2,16,16,
+                              PL_FMT_CAP_RENDERABLE|PL_FMT_CAP_SAMPLEABLE|PL_FMT_CAP_LINEAR);
+        pl_tex chroma=fmt?get_fbo(pass,w/2,h/2,fmt,2,PL_DEBUG_TAG):NULL;
+        pl_shader sh=pl_dispatch_begin(pass->rr->dp);
+        bool ok=chroma && skip_reference_rows(pass,sh,2) &&
+            sh_dovi_p5_fast_grid(sh,data,image,true) &&
+            pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=chroma));
+        pl_dispatch_abort(pass->rr->dp,&sh);
+        if(!ok)return false;
+        pl_shader luma=pl_dispatch_begin_ex(pass->rr->dp,true);
+        sh=pl_dispatch_begin_ex(pass->rr->dp,true);
+        ok=skip_inactive_rows(pass,luma,h,true) && sh_dovi_p5_fast_grid(luma,data,image,false) &&
+            sh_dovi_p5_fast_output(sh,luma,chroma,w,h);
+        pl_dispatch_abort(pass->rr->dp,&luma);
+        if(!ok){pl_dispatch_abort(pass->rr->dp,&sh);return false;}
+        pass->img=(struct img){.sh=sh,.w=w,.h=h,.comps=3,.repr=pl_color_repr_rgb,
+            .color=image->color,.rect={0,0,w,h}};
+        pass->ref_rect=pass->img.rect;
+        pass_hook(pass,&pass->img,PL_HOOK_NATIVE);
+        return true;
+    }
+    if(pass->rr->gpu->glsl.subgroup_size && sh_dovi_reference_identity(data) &&
+       fmodf(pass->target.crop.y0,2.0f)==0.0f){
+        bool top_left=false;
+        for(int p=0;p<image->num_planes;p++)
+            if(image->planes[p].component_mapping[0]==1)top_left=image->planes[p].shift_y==-.5f;
+        pl_shader sh=pl_dispatch_begin_ex(pass->rr->dp,true);
+        /* Inactive rows must still reach the carrier output hook. */
+        bool ok=sh_dovi_reference_identity_output(sh,data,image,top_left);
+        if(!ok){pl_dispatch_abort(pass->rr->dp,&sh);return false;}
+        pass->img=(struct img){.sh=sh,.w=w,.h=h,.comps=3,.repr=pl_color_repr_rgb,
+            .color=image->color,.rect={0,0,w,h}};
+        pass->ref_rect=pass->img.rect;
+        pass_hook(pass,&pass->img,PL_HOOK_NATIVE);
+        return true;
+    }
+    pl_tex luma_el=NULL;
+    const struct pl_frame *el=image->enhancement_layer;
+    bool resize=data->residual && el && el->crop.x1*2==w && el->crop.y1*2==h;
+    for (int c=0;c<2;c++) {
+        pl_fmt fmt=pl_find_fmt(pass->rr->gpu,PL_FMT_FLOAT,c?2:1,32,32,
+                              PL_FMT_CAP_RENDERABLE|PL_FMT_CAP_SAMPLEABLE);
+        if (!fmt) return false;
+        pl_tex vertical=NULL;
+        if (resize) {
+            const struct pl_bit_encoding bits=el->repr.bits;
+            int storage=bits.sample_depth?bits.sample_depth:data->el_depth;
+            // Bound all possible storage words, including out-of-range padding.
+            bool packed_rows=data->contract==2 && bits.bit_shift>=0 && bits.bit_shift<storage &&
+                storage-bits.bit_shift<=10;
+            int height=(c?h/2:h)/(packed_rows?2:1);
+            vertical=get_fbo(pass,c?w/4:w/2,height,fmt,c?2:1,PL_DEBUG_TAG);
+            pl_shader sh=pl_dispatch_begin(pass->rr->dp);
+            bool rows=packed_rows?skip_reference_rows(pass,sh,c?4:2):
+                c?skip_reference_rows(pass,sh,2):skip_inactive_rows(pass,sh,h,false);
+            bool ok=vertical && rows && sh_dovi_reference_el_vertical(sh,data,image,c,packed_rows) &&
+                pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=vertical));
+            pl_dispatch_abort(pass->rr->dp,&sh);
+            if (!ok) return false;
+        }
+        if (!c) {
+            luma_el=vertical;
+            continue;
+        }
+        if(data->contract==2)fmt=pl_find_fmt(pass->rr->gpu,PL_FMT_FLOAT,1,32,32,
+                              PL_FMT_CAP_RENDERABLE|PL_FMT_CAP_SAMPLEABLE);
+        if(!fmt)return false;
+        planes[c]=get_fbo(pass,c?w/2:w,c?h/2:h,fmt,data->contract==2?1:c?2:1,PL_DEBUG_TAG);
+        pl_shader sh=pl_dispatch_begin(pass->rr->dp);
+        bool ok=planes[c] && skip_reference_rows(pass,sh,2) &&
+            sh_dovi_reference_grid(sh,data,image,c,vertical,&pass->rr->cb1_mmr_state) &&
+            pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=planes[c]));
+        pl_dispatch_abort(pass->rr->dp,&sh);
+        if (!ok) return false;
+    }
+    bool top_left=false;
+    for(int p=0;p<image->num_planes;p++)
+        if(image->planes[p].component_mapping[0]==1)top_left=image->planes[p].shift_y==-.5f;
+    const bool paired=data->contract==2;
+    pl_fmt fmt=pl_find_fmt(pass->rr->gpu,PL_FMT_FLOAT,2,32,32,
+                          PL_FMT_CAP_RENDERABLE|PL_FMT_CAP_SAMPLEABLE);
+    if (!fmt) return false;
+    pl_tex chroma=get_fbo(pass,w/2,paired?h/2:h,fmt,2,PL_DEBUG_TAG);
+    pl_shader sh=pl_dispatch_begin(pass->rr->dp);
+    bool ok=chroma && (paired?skip_reference_rows(pass,sh,2):skip_inactive_rows(pass,sh,h,false)) &&
+        sh_dovi_reference_chroma(sh,planes[1],data->output_depth,top_left,paired) &&
+        pl_dispatch_finish(pass->rr->dp,pl_dispatch_params(.shader=&sh,.target=chroma));
+    pl_dispatch_abort(pass->rr->dp,&sh);
+    if (!ok) return false;
+    pl_shader luma=pl_dispatch_begin_ex(pass->rr->dp,true);
+    sh=pl_dispatch_begin_ex(pass->rr->dp,true);
+    ok=skip_inactive_rows(pass,luma,h,true) && sh_dovi_reference_grid(luma,data,image,false,luma_el,NULL) &&
+        sh_dovi_reference_output(sh,luma,chroma,data->output_depth,w,h,paired);
+    pl_dispatch_abort(pass->rr->dp,&luma);
+    if (!ok) {
+        pl_dispatch_abort(pass->rr->dp,&sh);
+        return false;
+    }
+    pass->img=(struct img){.sh=sh,.w=w,.h=h,.comps=3,.repr=pl_color_repr_rgb,
+        .color=image->color,.rect={0,0,w,h}};
+    pass->ref_rect=pass->img.rect;
+    pass_hook(pass,&pass->img,PL_HOOK_NATIVE);
+    return true;
+}
+
 // This scales and merges all of the source images, and initializes pass->img.
 static bool pass_read_image(struct pass_state *pass)
 {
+    if (pass->params->cb1_dovi_reference)
+        return pass_read_dovi_reference(pass);
     const struct pl_render_params *params = pass->params;
     struct pl_frame *image = &pass->image;
     pl_renderer rr = pass->rr;
@@ -2132,6 +2340,10 @@ static bool pass_read_image(struct pass_state *pass)
         if (compose_el) {
             el_sh = sample_el(pass, image->enhancement_layer);
             if (!el_sh) {
+                if (params->cb1_fel_filter == 2) {
+                    PL_ERR(rr, "Reference FEL filtering failed; refusing BL-only reconstruction");
+                    return false;
+                }
                 PL_ERR(rr, "Failed sampling enhancement layer; "
                            "falling back to base-layer-only rendering");
                 rr->errors |= PL_RENDER_ERR_SAMPLING;
@@ -2139,7 +2351,8 @@ static bool pass_read_image(struct pass_state *pass)
         }
 #endif
         if (params->cb1_dovi_transport) {
-            pl_shader_dovi_reconstruct_ex(sh, &pass->img.repr, el_sh, params->cb1_processing);
+            if (pass->img.repr.sys != PL_COLOR_SYSTEM_RGB)
+                pl_shader_dovi_reconstruct_ex(sh, &pass->img.repr, el_sh, params->cb1_processing);
             // Internal carrier only. The output hook owns opponent encoding.
             pass->img.repr.sys = PL_COLOR_SYSTEM_RGB;
             pass->img.repr.levels = PL_COLOR_LEVELS_FULL;

@@ -3,6 +3,62 @@
 #include <libplacebo/shaders/colorspace.h>
 #include <libplacebo/renderer.h>
 #include <math.h>
+#include "mmr_lut.h"
+
+struct reference_mmr_key {
+    int64_t coefficients[2][3][3];
+    uint64_t order[2], depth;
+};
+
+static void reference_mmr_fill(void *ptr, const struct sh_lut_params *params)
+{
+    const struct reference_mmr_key *key=params->priv;
+    float *words=ptr;
+    for (int axis=0;axis<3;axis++) {
+        for (int s=0;s<params->width;s++) {
+            for (int c=0;c<2;c++) {
+                uint64_t value=reference_mmr_contribution(key->coefficients[c][axis],key->order[c],s,key->depth);
+                *words++=value&0xffffff;
+                *words++=(int64_t)value>>24;
+            }
+        }
+    }
+}
+
+static ident_t reference_mmr_lut(pl_shader sh, const struct pl_cb1_dovi_reference *data,
+                               pl_shader_obj *state)
+{
+    if (!state || data->contract!=2 || (data->bl_depth!=8 && data->bl_depth!=10)) return NULL_IDENT;
+    struct reference_mmr_key key={.depth=data->bl_depth};
+    for (int c=0;c<2;c++) {
+        const struct pl_cb1_dovi_component *comp=&data->comp[c+1];
+        if (comp->num_pivots!=2 || comp->method[0]!=1 || comp->order[0]<1 || comp->order[0]>3)
+            return NULL_IDENT;
+        key.order[c]=comp->order[0];
+        for (int axis=0;axis<3;axis++) {
+            uint64_t bound=0;
+            for (unsigned order=0;order<key.order[c];order++) {
+                int64_t value=comp->mmr[0][order][axis];
+                if (value<INT32_MIN || value>INT32_MAX) return NULL_IDENT;
+                bound+=(uint64_t)llabs(value);
+                key.coefficients[c][axis][order]=value;
+            }
+            /* Q20 powers are below 2^20; both stored chunks remain exact FP32 integers. */
+            if (bound>0xfffffff) return NULL_IDENT;
+        }
+    }
+    pl_fmt fmt=pl_find_fmt(SH_GPU(sh),PL_FMT_FLOAT,4,32,32,PL_FMT_CAP_SAMPLEABLE);
+    if (!fmt) return NULL_IDENT;
+    return sh_lut(sh,sh_lut_params(.object=state,.var_type=PL_VAR_FLOAT,
+        .lut_type=SH_LUT_TEXTURE,.method=SH_LUT_NONE,.fmt=fmt,
+        .width=1<<data->bl_depth,.height=3,.comps=4,
+        .signature=pl_mem_hash(&key,sizeof(key)),.fill=reference_mmr_fill,.priv=&key));
+}
+
+PL_API unsigned pl_cb1_dovi_reference_paired_rows_abi(void)
+{
+    return 1;
+}
 
 static ident_t wide_values(pl_shader sh, const char *name, const int64_t *values, int count)
 {
@@ -23,10 +79,10 @@ static ident_t wide_values(pl_shader sh, const char *name, const int64_t *values
 
 static bool reference_component(pl_shader sh, const struct pl_cb1_dovi_reference *data,
                                 int component, ident_t bl_signal, ident_t el_signal,
-                                const ident_t bounds[2])
+                                const ident_t bounds[2], ident_t mmr_lut)
 {
     struct pl_glsl_version glsl = sh_glsl(sh);
-    if (!data || data->contract != 1 || component < 0 || component > 2 ||
+    if (!data || (data->contract != 1 && data->contract != 2) || component < 0 || component > 2 ||
         (data->bl_depth != 8 && data->bl_depth != 10) || data->denom > 23 ||
         (data->output_depth != 10 && data->output_depth != 12) || !bl_signal ||
         (data->residual && (!el_signal || (data->el_depth != 8 && data->el_depth != 10))) ||
@@ -96,6 +152,12 @@ static bool reference_component(pl_shader sh, const struct pl_cb1_dovi_reference
     for (int p=0;p+1<comp->num_pivots;p++)
         identity &= comp->method[p]==0 && comp->order[p]==1 &&
             comp->poly[p][0]==0 && comp->poly[p][1]==(INT64_C(1)<<data->denom);
+    if(identity && data->contract==2 && !data->residual &&
+       lows[component]<=highs[component] && highs[component]<=(1u<<data->bl_depth)-1) {
+        GLSL("float h=float(s[%d]<<%du);color=vec4(h,h,h,1.0);}\n",component,data->output_depth-data->bl_depth);
+        sh_describe(sh,"integer Dolby Vision reference component");
+        return true;
+    }
     if (identity)
         GLSL("accumulator="$"(uvec2(s[%d],0u),%du);\n",shl,component,data->denom+20-data->bl_depth);
     for (int p = 0; !identity && p + 1 < comp->num_pivots; p++) {
@@ -115,13 +177,17 @@ static bool reference_component(pl_shader sh, const struct pl_cb1_dovi_reference
                  20-data->bl_depth,20-data->bl_depth,20-data->bl_depth,
                  20-2*data->bl_depth,20-2*data->bl_depth,20-2*data->bl_depth,qmul);
             GLSL("accumulator="$"("$"[%d],1048576u);\n", coefficient_mul, coeff, offset);
-            GLSL("for(int j=0;j<7;j++)accumulator="$"(accumulator,"$"("$"[%d+j],t[j]));\n",add,coefficient_mul,coeff,offset+1);
+            if (mmr_lut) for (int axis=0;axis<3;axis++)
+                GLSL("{vec2 v="$"(ivec2(s[%d],%d)).%s;uint hi=uint(int(v.y));"
+                     "accumulator="$"(accumulator,uvec2(uint(v.x)|(hi<<24u),uint(int(hi)>>8)));}\n",
+                     mmr_lut,axis,axis,component==1?"rg":"ba",add);
+            GLSL("for(int j=%d;j<7;j++)accumulator="$"(accumulator,"$"("$"[%d+j],t[j]));\n",mmr_lut?3:0,add,coefficient_mul,coeff,offset+1);
             if (comp->order[p] >= 2) {
-                GLSL("uint t2[7];for(int j=0;j<7;j++){t2[j]="$"(t[j],t[j]);"
-                     "accumulator="$"(accumulator,"$"("$"[%d+j],t2[j]));}\n",qmul,add,coefficient_mul,coeff,offset+8);
+                GLSL("uint t2[7];for(int j=%d;j<7;j++){t2[j]="$"(t[j],t[j]);"
+                     "accumulator="$"(accumulator,"$"("$"[%d+j],t2[j]));}\n",mmr_lut?3:0,qmul,add,coefficient_mul,coeff,offset+8);
             }
             if (comp->order[p] >= 3)
-                GLSL("for(int j=0;j<7;j++)accumulator="$"(accumulator,"$"("$"[%d+j],"$"(t[j],t2[j])));\n",add,coefficient_mul,coeff,offset+15,qmul);
+                GLSL("for(int j=%d;j<7;j++)accumulator="$"(accumulator,"$"("$"[%d+j],"$"(t[j],t2[j])));\n",mmr_lut?3:0,add,coefficient_mul,coeff,offset+15,qmul);
         }
         GLSL("}\n");
     }
@@ -167,7 +233,7 @@ bool pl_shader_dovi_reference_component(pl_shader sh, const struct pl_cb1_dovi_r
     if (!base || !data || (data->residual && !enhancement)) return false;
     ident_t bl = sh_subpass(sh,base), el = NULL_IDENT;
     if (data->residual) el = sh_subpass(sh,enhancement);
-    return bl && (!data->residual || el) && reference_component(sh,data,component,bl,el,NULL);
+    return bl && (!data->residual || el) && reference_component(sh,data,component,bl,el,NULL,NULL_IDENT);
 }
 
 /* Raw 4:2:0 grids, without normalization, interpolation or crop recentering. */
@@ -216,7 +282,7 @@ bool pl_cb1_dovi_reference_frame_supported(const struct pl_frame *frame, unsigne
 }
 
 static bool reference_planes(pl_shader sh, const struct pl_frame *frame,
-                             unsigned depth, ident_t raw[3])
+                             unsigned depth, ident_t raw[3], bool exact_unpack)
 {
     if(!pl_cb1_dovi_reference_frame_supported(frame,depth))return false;
     int width=frame->crop.x1,height=frame->crop.y1;
@@ -234,58 +300,110 @@ static bool reference_planes(pl_shader sh, const struct pl_frame *frame,
             GLSLH("int "$"(ivec2 p){p=clamp(p,ivec2(0),ivec2(%d,%d));",
                   raw[c], sw-1, shgt-1);
             if (plane->flipped) GLSLH("p.y=%d-p.y;", shgt-1);
-            GLSLH("return int(round(texelFetch("$",p,0)[%d]*%u.0))>>%uu;}\n",
-                  sampler, channel, (1u<<storage)-1, shift);
+            if(exact_unpack)
+                GLSLH("return int(texelFetch("$",p,0)[%d]*(%u.0/%u.0)+(0.5/%u.0));}\n",
+                      sampler,channel,(1u<<storage)-1,1u<<shift,1u<<shift);
+            else GLSLH("return int(round(texelFetch("$",p,0)[%d]*%u.0))>>%uu;}\n",
+                       sampler, channel, (1u<<storage)-1, shift);
         }
     }
     return raw[0] && raw[1] && raw[2];
 }
 
-static ident_t reference_el_vertical(pl_shader sh, ident_t raw, bool chroma)
+static ident_t reference_el_vertical(pl_shader sh, ident_t raw, bool chroma, bool packed_rows)
 {
-    ident_t vertical = sh_fresh(sh,"ref_el_vertical");
-    if (chroma) {
-        GLSLH("int "$"(ivec2 p){int y=p.y/2;int s=(p.y&1)==0?"
-              "64*"$"(ivec2(p.x,y-1))+192*"$"(ivec2(p.x,y)):"
-              "192*"$"(ivec2(p.x,y))+64*"$"(ivec2(p.x,y+1));"
-              "return clamp((s+128)>>8,0,65535);}\n",vertical,raw,raw,raw,raw);
+    static const int luma[2][5]={{-3,29,111,-9,0},{0,-9,111,29,-3}};
+    static const int uv[2][5]={{0,64,192,0,0},{0,0,192,64,0}};
+    const int (*weights)[5]=chroma?uv:luma;
+    const int shift=chroma?8:7, bias=1<<(shift-1);
+    ident_t vertical=sh_fresh(sh,"ref_el_vertical");
+    GLSLH("int "$"(ivec2 p){\n",vertical);
+    if (packed_rows) {
+        // Read each shared tap once and store the two phases exactly in FP32.
+        // For 10-bit samples the luma peak is (140 * 1023 + 64) >> 7 = 1119.
+        for (int i=0;i<5;i++)
+            if (weights[0][i] || weights[1][i])
+                GLSLH("int t%d="$"(p+ivec2(0,%d));\n",i,raw,i-2);
+        GLSLH("int s[2];\n");
+        for (int phase=0;phase<2;phase++) {
+            GLSLH("s[%d]=max(0,(%d",phase,bias);
+            for (int i=0;i<5;i++)
+                if (weights[phase][i]) GLSLH("+(%d)*t%d",weights[phase][i],i);
+            GLSLH(")>>%d);\n",shift);
+        }
+        GLSLH("return s[0]|(s[1]<<11);}\n");
     } else {
-        GLSLH("int "$"(ivec2 p){int y=p.y/2;int s=(p.y&1)==0?"
-              "-3*"$"(ivec2(p.x,y-2))+29*"$"(ivec2(p.x,y-1))+111*"$"(ivec2(p.x,y))-9*"$"(ivec2(p.x,y+1)):"
-              "-9*"$"(ivec2(p.x,y-1))+111*"$"(ivec2(p.x,y))+29*"$"(ivec2(p.x,y+1))-3*"$"(ivec2(p.x,y+2));"
-              "return clamp((s+64)>>7,0,65535);}\n",vertical,raw,raw,raw,raw,raw,raw,raw,raw);
+        GLSLH("int y=p.y/2;int s=(p.y&1)==0?");
+        for (int phase=0;phase<2;phase++) {
+            GLSLH("%s(%d",phase?":":"",bias);
+            for (int i=0;i<5;i++)
+                if (weights[phase][i])
+                    GLSLH("+(%d)*"$"(ivec2(p.x,y+%d))",weights[phase][i],raw,i-2);
+            GLSLH(")");
+        }
+        GLSLH(";return clamp(s>>%d,0,65535);}\n",shift);
     }
     return vertical;
 }
 
 bool sh_dovi_reference_el_vertical(pl_shader sh, const struct pl_cb1_dovi_reference *data,
-                                   const struct pl_frame *image, bool chroma)
+                                   const struct pl_frame *image, bool chroma, bool packed_rows)
 {
-    if (!data || !data->residual || !image || !image->enhancement_layer ||
-        !sh_require(sh,PL_SHADER_SIG_NONE,0,0)) return false;
+    return data && data->residual && image && image->enhancement_layer &&
+        sh_dovi_fel_vertical(sh,image->enhancement_layer,data->el_depth,chroma,packed_rows);
+}
+
+bool sh_dovi_fel_vertical(pl_shader sh,const struct pl_frame *el,unsigned depth,
+                          bool chroma,bool packed_rows)
+{
+    if (!el || !sh_require(sh,PL_SHADER_SIG_NONE,0,0)) return false;
     ident_t raw[3]={0};
-    if (!reference_planes(sh,image->enhancement_layer,data->el_depth,raw)) return false;
+    if (!reference_planes(sh,el,depth,raw,false)) return false;
     GLSL("vec4 color=vec4(0.0,0.0,0.0,1.0);\n");
     for (int c=chroma?1:0;c<(chroma?3:1);c++) {
-        ident_t vertical=reference_el_vertical(sh,raw[c],chroma);
+        ident_t vertical=reference_el_vertical(sh,raw[c],chroma,packed_rows);
         GLSL("color[%d]=float("$"(ivec2(gl_FragCoord.xy)));\n",chroma?c-1:0,vertical);
     }
     return true;
 }
 
-static ident_t reference_el_horizontal(pl_shader sh, pl_tex texture, ident_t sampler, int lane)
+static ident_t reference_el_horizontal(pl_shader sh, pl_tex texture, ident_t sampler, int lane, bool paired, bool packed_rows)
 {
     ident_t vertical=sh_fresh(sh,"ref_el_cached");
-    GLSLH("int "$"(ivec2 p){p=clamp(p,ivec2(0),ivec2(%d,%d));"
-          "return int(texelFetch("$",p,0)[%d]);}\n",
-          vertical,texture->params.w-1,texture->params.h-1,sampler,lane);
+    if (packed_rows) {
+        GLSLH("int "$"(ivec2 p){p=clamp(p,ivec2(0),ivec2(%d,%d));"
+              "uint codes=uint(texelFetch("$",ivec2(p.x,p.y>>1),0)[%d]);"
+              "return int((codes>>uint(11*(p.y&1)))&2047u);}\n",
+              vertical,texture->params.w-1,2*texture->params.h-1,sampler,lane);
+    } else {
+        GLSLH("int "$"(ivec2 p){p=clamp(p,ivec2(0),ivec2(%d,%d));"
+              "return int(texelFetch("$",p,0)[%d]);}\n",
+              vertical,texture->params.w-1,texture->params.h-1,sampler,lane);
+    }
     ident_t horizontal = sh_fresh(sh,"ref_el_horizontal");
     GLSLH("int "$"(ivec2 p){int x=p.x/2;if((p.x&1)==0)return "$"(ivec2(x,p.y));int s=0;\n",horizontal,vertical);
     const int weights[8] = {22,94,-524,2456,2456,-524,94,22};
-    for (int t=0;t<8;t++)
+    if(paired)for(int t=0;t<4;t++)
+        GLSLH("s+=%d*("$"(ivec2(x+%d,p.y))+"$"(ivec2(x+%d,p.y)));\n",
+              weights[t],vertical,t-3,vertical,4-t);
+    else for (int t=0;t<8;t++)
         GLSLH("s+=%d*"$"(ivec2(x+%d,p.y));\n",weights[t],vertical,t-3);
     GLSLH("return clamp((s+2048)>>12,0,65535);}\n");
     return horizontal;
+}
+
+bool sh_dovi_fel_horizontal(pl_shader sh,pl_tex vertical,unsigned depth,bool chroma)
+{
+    if (!vertical || (depth!=8 && depth!=10) || !sh_require(sh,PL_SHADER_SIG_NONE,0,0)) return false;
+    ident_t sampler=sh_bind(sh,vertical,PL_TEX_ADDRESS_CLAMP,PL_TEX_SAMPLE_NEAREST,
+        "fel_vertical",NULL,NULL,NULL);
+    if (!sampler) return false;
+    GLSL("vec4 color=vec4(0.0,0.0,0.0,1.0);\n");
+    for(int c=0;c<(chroma?2:1);c++){
+        ident_t sample=reference_el_horizontal(sh,vertical,sampler,c,false,false);
+        GLSL("color[%d]=float("$"(ivec2(gl_FragCoord.xy)))/%u.0;\n",c,sample,(1u<<depth)-1);
+    }
+    return true;
 }
 
 static bool p5_fast_component(pl_shader sh, const struct pl_cb1_dovi_reference *data,
@@ -332,15 +450,16 @@ static bool p5_fast_component(pl_shader sh, const struct pl_cb1_dovi_reference *
 }
 
 static bool reference_grid(pl_shader sh, const struct pl_cb1_dovi_reference *data,
-                           const struct pl_frame *image, bool chroma, pl_tex vertical, bool fast)
+                           const struct pl_frame *image, bool chroma, pl_tex vertical, bool fast,
+                           pl_shader_obj *mmr_state)
 {
     if (!data || !image || !sh_require(sh,PL_SHADER_SIG_NONE,0,0)) return false;
     GLSL("vec4 color;\n");
     ident_t raw[3]={0}, el[3]={0};
-    if (!reference_planes(sh,image,data->bl_depth,raw)) return false;
+    if (!reference_planes(sh,image,data->bl_depth,raw,false)) return false;
     if (data->residual) {
         const struct pl_frame *enhancement=image->enhancement_layer;
-        if (!reference_planes(sh,enhancement,data->el_depth,el)) return false;
+        if (!reference_planes(sh,enhancement,data->el_depth,el,false)) return false;
         int phase[2]={-1,-1};
         for(int f=0;f<2;f++){
             const struct pl_frame *layer=f?enhancement:image;
@@ -358,8 +477,11 @@ static bool reference_grid(pl_shader sh, const struct pl_cb1_dovi_reference *dat
             ident_t sampler=sh_bind(sh,vertical,PL_TEX_ADDRESS_CLAMP,PL_TEX_SAMPLE_NEAREST,
                                     "ref_el_vertical",NULL,NULL,NULL);
             if (!sampler) return false;
+            // A texture at source height stores both row phases in each texel.
+            bool packed_rows=vertical->params.h==enhancement->crop.y1/(chroma?2:1);
             for (int c=chroma?1:0;c<(chroma?3:1);c++) {
-                el[c]=reference_el_horizontal(sh,vertical,sampler,chroma?c-1:0);
+                el[c]=reference_el_horizontal(sh,vertical,sampler,chroma?c-1:0,
+                                               data->contract==2,packed_rows);
             }
         }
     }
@@ -385,6 +507,7 @@ static bool reference_grid(pl_shader sh, const struct pl_cb1_dovi_reference *dat
     ident_t bounds[2]={
         sh_var(sh,(struct pl_shader_var){.var=pl_var_uvec3("ref_low"),.data=lows,.dynamic=true}),
         sh_var(sh,(struct pl_shader_var){.var=pl_var_uvec3("ref_high"),.data=highs,.dynamic=true})};
+    ident_t mmr_lut=chroma?reference_mmr_lut(sh,data,mmr_state):NULL_IDENT;
     for (int c=chroma?1:0;c<(chroma?3:1);c++) {
         ident_t esig=NULL_IDENT;
         if (data->residual) {
@@ -392,25 +515,29 @@ static bool reference_grid(pl_shader sh, const struct pl_cb1_dovi_reference *dat
             GLSLH("vec4 "$"(){return vec4(float("$"(ivec2("$"))));}\n",esig,el[c],position);
         }
         if (fast ? !p5_fast_component(sh,data,c,signal,bounds) :
-                   !reference_component(sh,data,c,signal,esig,bounds)) return false;
+                   !reference_component(sh,data,c,signal,esig,bounds,mmr_lut)) return false;
         if (chroma && c==1) GLSL("float ref_cb=color.r;\n");
     }
-    if (chroma) GLSL("color=vec4(ref_cb,color.r,0.0,1.0);\n");
+    if (chroma) {
+        if(data->contract==2 && !fast)GLSL("color=vec4(float(uint(ref_cb)|(uint(color.r)<<12u)),0.0,0.0,1.0);\n");
+        else GLSL("color=vec4(ref_cb,color.r,0.0,1.0);\n");
+    }
     if (chroma && fast) GLSL("color.rg/=4095.0;\n");
     return true;
 }
 
 bool sh_dovi_reference_grid(pl_shader sh, const struct pl_cb1_dovi_reference *data,
-                            const struct pl_frame *image, bool chroma, pl_tex vertical)
+                            const struct pl_frame *image, bool chroma, pl_tex vertical,
+                            pl_shader_obj *mmr_state)
 {
-    return reference_grid(sh,data,image,chroma,vertical,false);
+    return reference_grid(sh,data,image,chroma,vertical,false,mmr_state);
 }
 
 bool sh_dovi_p5_fast_grid(pl_shader sh, const struct pl_cb1_dovi_reference *data,
                          const struct pl_frame *image, bool chroma)
 {
     if(!data || data->residual || data->bl_depth!=10 || data->output_depth!=12)return false;
-    return reference_grid(sh,data,image,chroma,NULL,true);
+    return reference_grid(sh,data,image,chroma,NULL,true,NULL);
 }
 
 bool sh_dovi_p5_fast_output(pl_shader sh, pl_shader luma, pl_tex chroma, int w, int h)
@@ -436,17 +563,100 @@ bool sh_dovi_p5_fast_output(pl_shader sh, pl_shader luma, pl_tex chroma, int w, 
     return true;
 }
 
-bool sh_dovi_reference_chroma(pl_shader sh, pl_tex chroma, unsigned depth, bool top_left)
+bool sh_dovi_reference_identity(const struct pl_cb1_dovi_reference *data)
+{
+    if(!data || data->contract!=2 || data->residual || data->denom>23 ||
+       (data->bl_depth!=8 && data->bl_depth!=10) ||
+       (data->output_depth!=10 && data->output_depth!=12))return false;
+    for(int c=0;c<3;c++){
+        const struct pl_cb1_dovi_component *comp=&data->comp[c];
+        if(comp->num_pivots<2 || comp->num_pivots>9 ||
+           comp->pivots[0]>comp->pivots[comp->num_pivots-1] ||
+           comp->pivots[comp->num_pivots-1]>=(1u<<data->bl_depth))return false;
+        for(int p=0;p+1<comp->num_pivots;p++)
+            if(comp->method[p]!=0 || comp->order[p]!=1 || comp->poly[p][0]!=0 ||
+               comp->poly[p][1]!=(INT64_C(1)<<data->denom))return false;
+    }
+    return true;
+}
+
+bool sh_dovi_reference_identity_output(pl_shader sh,
+    const struct pl_cb1_dovi_reference *data, const struct pl_frame *image, bool top_left)
+{
+    if(!sh_glsl(sh).subgroup_size || !sh_dovi_reference_identity(data) ||
+       !sh_require(sh,PL_SHADER_SIG_NONE,0,0))return false;
+    sh_describe(sh,"Exact identity chroma quad reuse");
+    ident_t raw[3]={0};
+    if(!reference_planes(sh,image,data->bl_depth,raw,true))return false;
+    int32_t values[4]={data->comp[1].pivots[0],data->comp[2].pivots[0],
+        data->comp[1].pivots[data->comp[1].num_pivots-1],data->comp[2].pivots[data->comp[2].num_pivots-1]};
+    ident_t bounds=sh_var(sh,(struct pl_shader_var){.var=pl_var_ivec4("ref_identity_bounds"),.data=values,.dynamic=true});
+    ident_t fetch=sh_fresh(sh,"ref_identity_chroma");
+    GLSLH("ivec2 "$"(ivec2 p){return clamp(ivec2("$"(p),"$"(p)),"$".xy,"$".zw);}\n",
+        fetch,raw[1],raw[2],bounds,bounds);
+    const int widen=data->output_depth-data->bl_depth;
+    ident_t position=sh_attr_vec2(sh,"ref_identity_position",&(pl_rect2df){0,0,image->crop.x1,image->crop.y1});
+    if(!position)return false;
+    GLSL("ivec2 p=ivec2("$"),uv=ivec2(0);\n",position);
+    /* Both row phases share seven source rows within a fragment quad. */
+    GLSL("vec2 even=vec2(0.0),odd=vec2(0.0);if((p.x&1)==0 && (p.y&1)==0){\n");
+    const int weights[2][6]={{2,-12,65,222,-25,4},{4,-25,222,65,-12,2}};
+    const int half[8]={22,94,-524,2456,2456,-524,94,22};
+    for(int i=0;i<(top_left?8:7);i++){
+        GLSL("vec2 tap%d=vec2("$"(ivec2(p.x/2,p.y/2+%d)));\n",i,fetch,i-3);
+        if(top_left){
+            if(i==3)GLSL("even=tap%d*%u.0;\n",i,1u<<widen);
+            GLSL("odd+=%d.0*tap%d;\n",half[i],i);
+        }else{
+            if(i<6)GLSL("even+=%d.0*tap%d;\n",weights[0][i],i);
+            if(i>0)GLSL("odd+=%d.0*tap%d;\n",weights[1][i-1],i);
+        }
+    }
+    if(top_left)GLSL("odd=floor((odd+vec2(%u.0))/%u.0);\n",1u<<(11-widen),1u<<(12-widen));
+    else GLSL("even=floor((even+vec2(%u.0))/%u.0);odd=floor((odd+vec2(%u.0))/%u.0);\n",
+              1u<<(7-widen),1u<<(8-widen),1u<<(7-widen),1u<<(8-widen));
+    GLSL("}ivec2 vertical=subgroupQuadSwapVertical(ivec2(odd));uv=(p.y&1)==0?ivec2(even):vertical;"
+         "ivec2 adjacent=subgroupQuadSwapHorizontal(uv);if((p.x&1)!=0)uv=adjacent;\n");
+    uint32_t y_bounds[2]={data->comp[0].pivots[0],data->comp[0].pivots[data->comp[0].num_pivots-1]};
+    ident_t yy=sh_var(sh,(struct pl_shader_var){.var=pl_var_uvec2("ref_identity_luma_bounds"),.data=y_bounds,.dynamic=true});
+    GLSL("uint y=clamp(uint("$"(p)),"$".x,"$".y)<<%du;"
+         "vec4 color=vec4(float(y),vec2(clamp(uv,ivec2(0),ivec2(%u))),%u.0)/%u.0;\n",
+        raw[0],yy,yy,data->output_depth-data->bl_depth,(1u<<data->output_depth)-1,
+        (1u<<data->output_depth)-1,(1u<<data->output_depth)-1);
+    return true;
+}
+
+bool sh_dovi_reference_chroma(pl_shader sh, pl_tex chroma, unsigned depth, bool top_left, bool paired)
 {
     if ((depth!=10 && depth!=12) || !sh_require(sh,PL_SHADER_SIG_NONE,0,0)) return false;
     ident_t c=sh_bind(sh,chroma,PL_TEX_ADDRESS_CLAMP,PL_TEX_SAMPLE_NEAREST,"ref_c",NULL,NULL,NULL);
     if (!c) return false;
     ident_t fetch=sh_fresh(sh,"ref_chroma");
-    GLSLH("ivec2 "$"(ivec2 p){p=clamp(p,ivec2(0),ivec2(%d,%d));return ivec2(round(texelFetch("$",p,0).rg));}\n",
+    if(paired)GLSLH("ivec2 "$"(ivec2 p){p=clamp(p,ivec2(0),ivec2(%d,%d));uint v=uint(texelFetch("$",p,0).r);return ivec2(v&4095u,v>>12u);}\n",
+          fetch,chroma->params.w-1,chroma->params.h-1,c);
+    else GLSLH("ivec2 "$"(ivec2 p){p=clamp(p,ivec2(0),ivec2(%d,%d));return ivec2(round(texelFetch("$",p,0).rg));}\n",
           fetch,chroma->params.w-1,chroma->params.h-1,c);
     GLSL("ivec2 p=ivec2(gl_FragCoord.xy);ivec2 uv=ivec2(0);\n");
     const int weights[2][6]={{2,-12,65,222,-25,4},{4,-25,222,65,-12,2}};
     const int half[8]={22,94,-524,2456,2456,-524,94,22};
+    if(paired) {
+        GLSL("ivec2 even=ivec2(0),odd=ivec2(0);\n");
+        for(int i=0;i<(top_left?8:7);i++) {
+            GLSL("ivec2 tap%d="$"(ivec2(p.x,p.y+%d));\n",i,fetch,i-3);
+            if(top_left) {
+                if(i==3)GLSL("even=tap%d;\n",i);
+            } else {
+                if(i<6)GLSL("even+=%d*tap%d;\n",weights[0][i],i);
+                if(i>0)GLSL("odd+=%d*tap%d;\n",weights[1][i-1],i);
+            }
+        }
+        if(top_left)GLSL("odd=22*(tap0+tap7)+94*(tap1+tap6)-524*(tap2+tap5)+2456*(tap3+tap4);"
+                         "odd=(odd+ivec2(2048))>>12;\n");
+        else GLSL("even=(even+ivec2(128))>>8;odd=(odd+ivec2(128))>>8;\n");
+        GLSL("even=clamp(even,ivec2(0),ivec2(%u));odd=clamp(odd,ivec2(0),ivec2(%u));"
+             "vec4 color=vec4(float(uint(even.x)|(uint(even.y)<<12u)),float(uint(odd.x)|(uint(odd.y)<<12u)),0.0,1.0);\n",(1u<<depth)-1,(1u<<depth)-1);
+        return true;
+    }
     for (int phase=0;phase<2;phase++) {
         GLSL("%s((p.y&1)==%d){\n",phase?"else if":"if",phase);
         int count=top_left?(phase?8:1):6;
@@ -462,7 +672,7 @@ bool sh_dovi_reference_chroma(pl_shader sh, pl_tex chroma, unsigned depth, bool 
     return true;
 }
 
-bool sh_dovi_reference_output(pl_shader sh, pl_shader luma, pl_tex chroma, unsigned depth, int w, int h)
+bool sh_dovi_reference_output(pl_shader sh, pl_shader luma, pl_tex chroma, unsigned depth, int w, int h, bool paired)
 {
     if ((depth!=10 && depth!=12) || !sh_require(sh,PL_SHADER_SIG_NONE,0,0)) return false;
     ident_t y=sh_subpass(sh,luma);
@@ -470,7 +680,11 @@ bool sh_dovi_reference_output(pl_shader sh, pl_shader luma, pl_tex chroma, unsig
     if (!y || !c) return false;
     ident_t position=sh_attr_vec2(sh,"ref_position",&(pl_rect2df){0,0,w,h});
     if (!position) return false;
-    GLSL("ivec2 p=ivec2("$");vec4 color=vec4("$"().r,"
+    if(paired)GLSL("ivec2 p=ivec2("$");vec2 phases=texelFetch("$",ivec2(p.x/2,p.y/2),0).rg;"
+        "uint uv=uint((p.y&1)==0?phases.r:phases.g);"
+        "vec4 color=vec4("$"().r,float(uv&4095u),float(uv>>12u),%u.0)/%u.0;\n",
+        position,c,y,(1u<<depth)-1,(1u<<depth)-1);
+    else GLSL("ivec2 p=ivec2("$");vec4 color=vec4("$"().r,"
          "texelFetch("$",ivec2(p.x/2,p.y),0).rg,%u.0)/%u.0;\n",
          position,y,c,(1u<<depth)-1,(1u<<depth)-1);
     return true;

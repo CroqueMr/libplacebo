@@ -373,8 +373,14 @@ struct pl_render_params {
     // Default off. Requires matched renderer headers and library.
 #define PL_CB1_CHROMA_FILTER_API 1
     bool cb1_fast_chroma;
+    // Explicit filter of the reconstruction EL only; default zero.
+#define PL_CB1_FEL_FILTER_API 2
+    // EL-only filter: 0 existing sampler, 1 GPU bilinear, 2 reference GPU.
+    unsigned cb1_fel_filter;
     // Borrowed opt-in CB1 processing contract. Requires a matched library.
     const struct pl_cb1_dovi_processing *cb1_processing;
+    // Per-picture integer reference. Null preserves existing composition.
+    const struct pl_cb1_dovi_reference *cb1_dovi_reference;
 
 
     // If this is true, all shaders will be generated as "dynamic" shaders,
@@ -416,6 +422,8 @@ struct pl_render_params {
 
 #define pl_render_params(...) (&(struct pl_render_params) { PL_RENDER_DEFAULTS __VA_ARGS__ })
 PL_API extern const struct pl_render_params pl_render_fast_params;
+
+PL_API unsigned pl_cb1_fel_filter_abi(void);
 
 // This contains the default/recommended options for reasonable image quality,
 // while also not being too terribly slow. All of the *_params structs are
