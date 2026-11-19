@@ -242,6 +242,21 @@ static inline void sh_describe(pl_shader sh, const char *desc)
 bool sh_require(pl_shader sh, enum pl_shader_sig insig, int w, int h);
 
 struct pl_dovi_metadata;
+struct pl_cb1_dovi_reference;
+struct pl_frame;
+bool sh_dovi_reference_el_vertical(pl_shader sh, const struct pl_cb1_dovi_reference *data,
+    const struct pl_frame *image, bool chroma);
+bool sh_dovi_reference_grid(pl_shader sh, const struct pl_cb1_dovi_reference *data,
+    const struct pl_frame *image, bool chroma, pl_tex vertical,
+    pl_shader_obj *mmr_state);
+bool sh_dovi_reference_identity(const struct pl_cb1_dovi_reference *data);
+bool sh_dovi_reference_identity_output(pl_shader sh,
+    const struct pl_cb1_dovi_reference *data, const struct pl_frame *image, bool top_left);
+bool sh_dovi_reference_chroma(pl_shader sh, pl_tex chroma, unsigned depth, bool top_left, bool paired);
+bool sh_dovi_reference_output(pl_shader sh, pl_shader luma, pl_tex chroma, unsigned depth, int w, int h, bool paired);
+bool sh_dovi_p5_fast_grid(pl_shader sh, const struct pl_cb1_dovi_reference *data,
+                         const struct pl_frame *image, bool chroma);
+bool sh_dovi_p5_fast_output(pl_shader sh, pl_shader luma, pl_tex chroma, int w, int h);
 
 // Add the NLQ-decoded enhancement-layer residual to the (already reshaped)
 // base layer. `el_signal` names a no-arg function (typically produced by

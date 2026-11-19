@@ -560,6 +560,7 @@ static void polar_sample(pl_shader sh, pl_filter filter,
 struct sh_sampler_obj {
     pl_filter filter;
     pl_shader_obj lut;
+    pl_shader_obj exact_lut;
     pl_shader_obj pass2; // for pl_shader_sample_ortho
 };
 
@@ -570,6 +571,7 @@ static void sh_sampler_uninit(pl_gpu gpu, void *ptr)
 {
     struct sh_sampler_obj *obj = ptr;
     pl_shader_obj_destroy(&obj->lut);
+    pl_shader_obj_destroy(&obj->exact_lut);
     pl_shader_obj_destroy(&obj->pass2);
     pl_filter_free(&obj->filter);
     *obj = (struct sh_sampler_obj) {0};
@@ -941,11 +943,47 @@ static void fill_ortho_lut(void *data, const struct sh_lut_params *params)
     }
 }
 
+static float half_rtz(float x)
+{
+    union { _Float16 h; uint16_t u; } value = {.h=x};
+    if (fabsf((float)value.h) > fabsf(x)) value.u--;
+    return value.h;
+}
+
+static void fill_exact_lut(void *data, const struct sh_lut_params *params)
+{
+    const struct sh_sampler_obj *obj = params->priv;
+    const pl_filter f = obj->filter;
+    float *dst = data;
+    for (int q = 0; q <= 256; q++) {
+        const float t = q / 256.0f;
+        for (int row = 0; row < 256; row++) {
+            float sum = 0;
+            for (int k = 0; k < 6; k++) {
+                float a = half_rtz(f->weights[row * f->row_stride + k]);
+                float b = half_rtz(f->weights[PL_MIN(row + 1,255) * f->row_stride + k]);
+                volatile float lo = (1.0f-t)*a, hi = t*b;
+                dst[k] = lo + hi;
+                sum += dst[k];
+            }
+            dst[6] = sum;
+            dst[7] = 0;
+            dst += 8;
+        }
+    }
+}
+
 enum {
     SEP_VERT = 0,
     SEP_HORIZ,
     SEP_PASSES
 };
+
+pl_fmt pl_sample_filter_cb1_fp32_lut_format(pl_gpu gpu)
+{
+    return pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+                       PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR);
+}
 
 bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
                              const struct pl_sample_filter_params *params)
@@ -962,9 +1000,33 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
     uint8_t comps;
     float ratio[SEP_PASSES], scale;
     ident_t src_tex, pos, pt;
+    // Lanczos taps are texel-centered along the filtered axis. Nearest tap
+    // fetches preserve the convolution when the other axis is aligned 1:1.
+    bool centered = false;
+    if (src->tex && src->new_w > 0 && src->new_h > 0 &&
+        (src->tex->params.format->caps & PL_FMT_CAP_LINEAR) &&
+        pl_rect_w(src->rect) != 0 &&
+        params->filter.kernel == &pl_filter_function_sinc &&
+        params->filter.window == &pl_filter_function_sinc &&
+        params->filter.radius == 3.0f && !params->filter.blur &&
+        !params->filter.clamp && !params->filter.taper)
+    {
+        // Match the pass selection below, including its 1:1 tolerance.
+        // An identity-size crop/shift must not select the wrong aligned axis.
+        float rx = src->new_w / fabs(pl_rect_w(src->rect));
+        if (fabs(rx - 1.0f) < 1e-6f) {
+            centered = src->new_w == src->tex->params.w &&
+                       src->rect.x0 == 0 &&
+                       src->rect.x1 == src->tex->params.w;
+        } else {
+            centered = src->new_h == src->tex->params.h &&
+                       src->rect.y0 == 0 &&
+                       src->rect.y1 == src->tex->params.h;
+        }
+    }
     if (!setup_src(sh, src, &src_tex, &pos, &pt,
                    &ratio[SEP_HORIZ], &ratio[SEP_VERT],
-                   &comps, &scale, false, LINEAR))
+                   &comps, &scale, false, centered ? NEAREST : LINEAR))
         return false;
 
 
@@ -1029,9 +1091,16 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
 
     int N = obj->filter->row_size; // number of samples to convolve
     int width = obj->filter->row_stride / 4; // width of the LUT texture
+    pl_fmt lut_fmt = params->cb1_fp32_lut ?
+        pl_sample_filter_cb1_fp32_lut_format(gpu) : NULL;
+    if (params->cb1_fp32_lut && !lut_fmt) {
+        SH_FAIL(sh, "CB policy requires FP32 linear orthogonal LUT storage!");
+        return false;
+    }
     ident_t lut = sh_lut(sh, sh_lut_params(
         .object     = &obj->lut,
         .var_type   = PL_VAR_FLOAT,
+        .fmt        = lut_fmt,
         .method     = SH_LUT_LINEAR,
         .width      = width,
         .height     = SCALER_LUT_SIZE,
@@ -1061,6 +1130,24 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
     bool use_ar = cfg.antiring > 0 && ratio[pass] > 1.0;
     bool use_linear = obj->filter->radius == obj->filter->radius_zero;
     use_ar &= !use_linear; // filter has no negative weights
+    bool exact_cache = params->cb1_exact_lut_cache && centered &&
+        !use_linear && N == 6 && !params->cb1_fp32_lut &&
+        (ratio[pass] == 2.0f || ratio[pass] == 4.0f);
+    ident_t exact_lut = 0;
+    bool quad_reuse = params->cb1_quad_scaler && centered && !use_linear &&
+        N == 6 && (comps == 0xF || comps == 0x7) && sh_glsl(sh).subgroup_size &&
+        ratio[pass] == 2.0f && ratio[1-pass] == 1.0f &&
+        src->rect.x0 == 0 && src->rect.y0 == 0 &&
+        src->rect.x1 == src->tex->params.w && src->rect.y1 == src->tex->params.h;
+    if (exact_cache) {
+        exact_lut = sh_lut(sh, sh_lut_params(
+            .object=&obj->exact_lut, .var_type=PL_VAR_FLOAT,
+            .lut_type=SH_LUT_TEXTURE, .method=SH_LUT_NONE,
+            .fmt=pl_find_fmt(gpu,PL_FMT_FLOAT,4,32,32,PL_FMT_CAP_SAMPLEABLE),
+            .width=512,.height=257,.comps=4,
+            .update=update,.fill=fill_exact_lut,.priv=obj));
+        if (!exact_lut) return false;
+    }
 
 #pragma GLSL /* pl_shader_sample_ortho */                                       \
     vec4 color = vec4(0.0, 0.0, 0.0, 1.0);                                      \
@@ -1072,9 +1159,28 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
     vec2 fcoord2 = fract(pos * size - vec2(0.5));                               \
     float fcoord = dot(fcoord2, dir);                                           \
     vec2 base = pos - fcoord * pt - pt * vec2(${const float: N / 2 - 1});       \
-    vec4 ws;                                                                    \
+    PRECISE vec4 ws;                                                            \
     float off;                                                                  \
     ${vecType: comps} c;                                                        \
+    @if (quad_reuse) {                                                         \
+        @if (pass == SEP_HORIZ)                                                \
+            bool odd = (int(gl_FragCoord.x) & 1) != 0;                          \
+        @else                                                                  \
+            bool odd = (int(gl_FragCoord.y) & 1) != 0;                          \
+        vec4 f0 = textureLod($src_tex, base + pt * float(0), 0.0);             \
+        vec4 f2 = textureLod($src_tex, base + pt * float(2), 0.0);             \
+        vec4 f4 = textureLod($src_tex, base + pt * float(4), 0.0);             \
+        @if (pass == SEP_HORIZ) {                                              \
+            vec4 p0 = subgroupQuadSwapHorizontal(f0);                          \
+            vec4 p2 = subgroupQuadSwapHorizontal(f2);                          \
+            vec4 p4 = subgroupQuadSwapHorizontal(f4);                          \
+        @} else {                                                              \
+            vec4 p0 = subgroupQuadSwapVertical(f0);                            \
+            vec4 p2 = subgroupQuadSwapVertical(f2);                            \
+            vec4 p4 = subgroupQuadSwapVertical(f4);                            \
+        @}                                                                     \
+        vec4 last = odd ? textureLod($src_tex, base + pt * float(5), 0.0) : p4; \
+    @}                                                                         \
     /* Mark the accumulators as `precise` to avoid accumulating the error. */   \
     PRECISE float wsum = 0.0;                                                   \
     PRECISE ${vecType: comps} ca = ${vecType: comps}(0.0);                      \
@@ -1082,14 +1188,28 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
         ${vecType: comps} hi = ${vecType: comps}(0.0);                          \
         ${vecType: comps} lo = ${vecType: comps}(1e9);                          \
     @}                                                                          \
+    @if (exact_cache) {                                                        \
+        float cache_row = (fcoord * 0.99609375 + 0.001953125) * 256.0 - 0.5;  \
+        ivec2 cache_index = ivec2(clamp(floor(cache_row),0.0,255.0),           \
+                                  clamp(floor(fract(cache_row)*256.0+0.5),0.0,256.0)); \
+    @}                                                                        \
     #pragma unroll 4                                                            \
     for (uint n = 0u; n < ${uint: N}; n += ${const uint: use_linear ? 2u : 1u}) { \
-        if (n % 4u == 0u)                                                        \
-            ws = $lut(vec2(float(n / 4u) / ${const float: denom}, fcoord));     \
+        if (n % 4u == 0u) {                                                     \
+            @if (exact_cache)                                                 \
+                ws = $exact_lut(ivec2(2*cache_index.x+int(n / 4u),cache_index.y)); \
+            @else                                                              \
+                ws = $lut(vec2(float(n / 4u) / ${const float: denom}, fcoord)); \
+        }                                                                      \
         off = float(n);                                                         \
         @if (use_linear)                                                        \
             off += ws[n % 4u + 1u];                                             \
-        c = textureLod($src_tex, base + pt * off, 0.0).${swizzle: comps};       \
+        @if (quad_reuse) {                                                     \
+            c = ((n & 1u) == 0u ? (n == 0u ? f0 : n == 2u ? f2 : f4) :       \
+                n == 1u ? (odd ? p2 : p0) : n == 3u ? (odd ? p4 : p2) : last).${swizzle: comps}; \
+        @} else {                                                              \
+            c = textureLod($src_tex, base + pt * off, 0.0).${swizzle: comps};   \
+        @}                                                                     \
         @if (use_ar) {                                                          \
             if (n == ${uint: N} / 2u - 1u || n == ${uint: N} / 2u) {            \
                 lo = min(lo, c);                                                \
@@ -1097,8 +1217,11 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
             }                                                                   \
         @}                                                                      \
         ca += ws[n % 4u] * c;                                                   \
-        wsum += ws[n % 4u];                                                     \
+        @if (!exact_cache)                                                     \
+            wsum += ws[n % 4u];                                                 \
     }                                                                           \
+    @if (exact_cache)                                                          \
+        wsum = ws.z;                                                           \
     /* Renormalize by the actual sum of weights. */                             \
     ca /= wsum;                                                                 \
     @if (use_ar)                                                                \
