@@ -247,8 +247,14 @@ void sh_dovi_compose_nlq(pl_shader sh, const struct pl_dovi_metadata *data,
     vec3 el_centered = el_sample - $off;                              \
     vec3 noise = 2.384185791015625e-7 * max(abs(el_sample), abs($off)); \
     el_centered = mix(el_centered, vec3(0.0), lessThanEqual(abs(el_centered), noise)); \
-    color.rgb += sign(el_centered) * (abs(el_centered) * $slp + $thr);  \
+    vec3 residual = sign(el_centered) * (abs(el_centered) * $slp + $thr);
+    if (data->cb1_native_bounds) {
+        ident_t maximum = sh_var(sh, (struct pl_shader_var) {
+            .var=pl_var_vec3("nlq_max"), .data=data->cb1_nlq_max,
+        });
+        GLSL("residual=clamp(residual,-"$","$");\n",maximum,maximum);
     }
+    GLSL("color.rgb += residual; }\n");
 #endif
 }
 
@@ -300,6 +306,16 @@ static void dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data,
          "vec4 coeffs;                          \n"
          "float s;                              \n"
          "sig = clamp(color.rgb, 0.0, 1.0);     \n");
+    if (data->cb1_native_bounds) {
+        float lo[3]={0},hi[3]={1,1,1};
+        for(int c=0;c<3;c++)if(data->comp[c].num_pivots>=2){
+            lo[c]=data->comp[c].pivots[0];
+            hi[c]=data->comp[c].pivots[data->comp[c].num_pivots-1];
+        }
+        ident_t lower=sh_var(sh,(struct pl_shader_var){.var=pl_var_vec3("input_min"),.data=lo});
+        ident_t upper=sh_var(sh,(struct pl_shader_var){.var=pl_var_vec3("input_max"),.data=hi});
+        GLSL("sig=clamp(sig,"$","$");\n",lower,upper);
+    }
 
     float coeffs_data[8][4];
     float mmr_packed_data[8*6][4];
@@ -315,6 +331,13 @@ static void dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data,
             continue;
 
         pl_assert(comp->num_pivots >= 2 && comp->num_pivots <= 9);
+        struct pl_reshape_data bounded;
+        if(data->cb1_native_bounds){
+            bounded=*comp;
+            bounded.pivots[0]=0;
+            bounded.pivots[bounded.num_pivots-1]=1;
+            comp=&bounded;
+        }
         struct pl_reshape_data compact;
         bool common_mmr = comp->num_pivots > 2 && comp->method[0] == 1;
         for (int i = 1; common_mmr && i < comp->num_pivots - 1; i++)
@@ -525,6 +548,11 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
 unsigned pl_cb1_processing_abi(void)
 {
     return PL_CB1_PROCESSING_ABI;
+}
+
+unsigned pl_cb1_dovi_reference_abi(void)
+{
+    return PL_CB1_DOVI_REFERENCE_ABI;
 }
 
 void pl_shader_dovi_reconstruct(pl_shader sh, struct pl_color_repr *repr,

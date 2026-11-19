@@ -950,6 +950,7 @@ PL_LIBAV_API void pl_map_dovi_metadata(struct pl_dovi_metadata *out,
     header = av_dovi_get_header(data);
     mapping = av_dovi_get_mapping(data);
     color = av_dovi_get_color(data);
+    out->cb1_native_bounds = false;
 
     for (int i = 0; i < 3; i++)
         out->nonlinear_offset[i] = av_q2d(color->ycc_to_rgb_offset[i]);
@@ -1015,6 +1016,7 @@ PL_LIBAV_API void pl_map_dovi_metadata(struct pl_dovi_metadata *out,
             dst->offset = el_scale * src->nlq_offset;
             dst->deadzone_slope = slope_scale_d * S;
             dst->deadzone_threshold = coef_scale_d * (T - 0.5 * S);
+            out->cb1_nlq_max[c] = coef_scale_d * src->vdr_in_max;
         }
     }
 }
