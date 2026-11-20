@@ -70,7 +70,8 @@ static void vk_cmd_destroy(struct vk_cmd *cmd)
         return;
 
     struct vk_ctx *vk = cmd->pool->vk;
-    vk_cmd_poll(cmd, UINT64_MAX);
+    if (cmd->sync.sem || cmd->fence)
+        vk_cmd_poll(cmd, UINT64_MAX);
     vk_cmd_reset(cmd);
     vk->DestroyFence(vk->dev, cmd->fence, PL_VK_ALLOC);
     vk->FreeCommandBuffers(vk->dev, cmd->pool->pool, 1, &cmd->buf);
@@ -263,10 +264,11 @@ struct vk_sync_scope vk_sem_barrier(struct vk_cmd *cmd, struct vk_sem *sem,
         last = sem->read;
 
     if (last.queue != cmd->queue) {
-        if (!is_write && sem->read.queue == cmd->queue) {
-            // No semaphore needed in this case because the implicit submission
-            // order execution dependencies already transitively imply a wait
-            // for the previous write
+        if (!is_write && sem->read.queue == cmd->queue &&
+            (sem->read.stage & stage) == stage)
+        {
+            // A previous semaphore wait on this queue already covers these stages
+            // and all following accesses in the same stages.
         } else if (last.sync.sem) {
             // Image barrier still needs to depend on this stage for implicit
             // ordering guarantees to apply properly. A synchronization point
@@ -412,7 +414,15 @@ struct vk_cmd *vk_cmd_begin(struct vk_cmdpool *pool, pl_debug_tag debug_tag)
 
     struct vk_cmd *cmd = NULL;
     pl_mutex_lock(&vk->lock);
-    if (!PL_ARRAY_POP(pool->cmds, &cmd)) {
+    // Skip commands another thread is still waiting on.
+    for (int i = pool->cmds.num - 1; i >= 0; i--) {
+        if (!pool->cmds.elem[i]->waiters) {
+            cmd = pool->cmds.elem[i];
+            PL_ARRAY_REMOVE_AT(pool->cmds, i);
+            break;
+        }
+    }
+    if (!cmd) {
         cmd = vk_cmd_create(pool);
         if (!cmd) {
             pl_mutex_unlock(&vk->lock);
@@ -573,10 +583,13 @@ bool vk_poll_commands(struct vk_ctx *vk, uint64_t timeout)
         struct vk_cmdpool *pool = cmd->pool;
         pl_vulkan_sem sync = cmd->sync;
         VkFence fence = cmd->fence;
+        cmd->waiters++;
         pl_mutex_unlock(&vk->lock); // don't hold mutex while blocking
-        if (vk_sync_poll(vk, fence, sync, timeout) == VK_TIMEOUT)
-            return ret;
+        VkResult res = vk_sync_poll(vk, fence, sync, timeout);
         pl_mutex_lock(&vk->lock);
+        cmd->waiters--;
+        if (res == VK_TIMEOUT)
+            break;
         if (!vk->cmds_pending.num || vk->cmds_pending.elem[0] != cmd ||
             cmd->sync.value != sync.value)
             continue; // another thread modified this state while blocking
