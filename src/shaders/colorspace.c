@@ -2154,12 +2154,14 @@ static void fill_gamut_lut(void *data, const struct sh_lut_params *params)
     // Convert to 16-bit unsigned integer for GPU texture
     const float *in = tmp;
     uint16_t *out = data;
+    // Preserve the authored CB1 gamut LUT's established chroma quantization.
+    const int bias = lut_params->function == &pl_cb1_gamut_map_perceptual ? 32767 : 32768;
     pl_assert(lut_params->lut_stride == 3);
     pl_assert(params->comps == 4);
     for (int i = 0; i < lut_size; i++) {
         out[0] = PL_CLAMP(roundf(in[0] * UINT16_MAX), 0, UINT16_MAX);
-        out[1] = PL_CLAMP(roundf(in[1] * UINT16_MAX + 32768), 0, UINT16_MAX);
-        out[2] = PL_CLAMP(roundf(in[2] * UINT16_MAX + 32768), 0, UINT16_MAX);
+        out[1] = PL_CLAMP(roundf(in[1] * UINT16_MAX + bias), 0, UINT16_MAX);
+        out[2] = PL_CLAMP(roundf(in[2] * UINT16_MAX + bias), 0, UINT16_MAX);
         out[3] = 0;
         in  += 3;
         out += 4;
