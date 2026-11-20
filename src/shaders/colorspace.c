@@ -2316,7 +2316,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         // far above its CIE Y.
         const float scene_max = PL_MAX(src.hdr.scene_max[0],
                 PL_MAX(src.hdr.scene_max[1], src.hdr.scene_max[2]));
-        if (scene_max > 0) {
+        if (!cb1_tone_path && scene_max > 0) {
             tone.input_max = PL_MAX(tone.input_max,
                 pl_hdr_rescale(PL_HDR_NITS, tone.input_scaling, scene_max));
         }
