@@ -27,6 +27,7 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl gl, const struct pl_opengl_params 
 
 struct pl_gl {
     struct pl_gpu_fns impl;
+    PFNGLBUFFERSTORAGEPROC buffer_storage;
     pl_opengl gl;
     uint64_t sig; // hash of GL_VERSION, GL_VENDOR, GL_RENDERER
     bool failed;

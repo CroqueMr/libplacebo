@@ -208,7 +208,8 @@ float pl_color_repr_normalize(struct pl_color_repr *repr)
     if (!tex_bits)
         tex_bits = col_bits = 8;
 
-    if (pl_color_levels_guess(repr) == PL_COLOR_LEVELS_LIMITED) {
+    const bool limited = pl_color_levels_guess(repr) == PL_COLOR_LEVELS_LIMITED;
+    if (limited) {
         // Limit range is always shifted directly
         scale *= (float) (1LL << tex_bits) / (1LL << col_bits);
     } else {
@@ -216,6 +217,34 @@ float pl_color_repr_normalize(struct pl_color_repr *repr)
         scale *= ((1LL << tex_bits) - 1.) / ((1LL << col_bits) - 1.);
     }
 
+    // The result is a signal of the sample depth when limited range, and of
+    // the color depth when full range
+    bool preserve_sample_depth = false;
+#ifdef PL_HAVE_DOVI
+    preserve_sample_depth = repr->sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+                            repr->dovi && repr->dovi->cb1_normalized;
+#endif
+    if (!preserve_sample_depth && (bits->sample_depth || bits->color_depth))
+        bits->sample_depth = limited ? tex_bits : col_bits;
+    bits->color_depth = bits->sample_depth;
+    return scale;
+}
+
+float pl_color_repr_code_scale(struct pl_color_repr *repr, int *out_depth)
+{
+    struct pl_bit_encoding *bits = &repr->bits;
+    int tex_bits = PL_DEF(bits->sample_depth, bits->color_depth);
+    int col_bits = PL_DEF(bits->color_depth, bits->sample_depth);
+    if (!tex_bits)
+        tex_bits = col_bits = 8;
+
+    float scale = ((1LL << tex_bits) - 1.) / (1LL << bits->bit_shift);
+    if (out_depth)
+        *out_depth = col_bits;
+
+    bits->bit_shift = 0;
+    if (bits->sample_depth || bits->color_depth)
+        bits->sample_depth = col_bits;
     bits->color_depth = bits->sample_depth;
     return scale;
 }
@@ -423,7 +452,7 @@ float pl_hdr_rescale(enum pl_hdr_scaling from, enum pl_hdr_scaling to, float x)
     // Convert input to PL_SCALE_RELATIVE
     switch (from) {
     case PL_HDR_PQ:
-        x = powf(x, 1.0f / PQ_M2);
+        x = powf(fminf(x, 1.0f), 1.0f / PQ_M2);
         x = fmaxf(x - PQ_C1, 0.0f) / (PQ_C2 - PQ_C3 * x);
         x = powf(x, 1.0f / PQ_M1);
         x *= 10000.0f;
@@ -655,7 +684,7 @@ void pl_color_linearize(const struct pl_color_space *csp, float color[3])
         MAP3(52.37f/48 * powf(X, 2.6f));
         goto scale_out;
     case PL_COLOR_TRC_PQ:
-        MAP3(powf(X, 1 / PQ_M2));
+        MAP3(powf(fminf(X, 1), 1 / PQ_M2));
         MAP3(fmaxf(X - PQ_C1, 0) / (PQ_C2 - PQ_C3 * X));
         MAP3(10000 / PL_COLOR_SDR_WHITE * powf(X, 1 / PQ_M1));
         goto scale_out;
@@ -761,7 +790,7 @@ void pl_color_delinearize(const struct pl_color_space *csp, float color[3])
         const float *coef = rgb2xyz.m[1];
         // OOTF^-1
         float luma = coef[0] * color[0] + coef[1] * color[1] + coef[2] * color[2];
-        luma = fmaxf(1e-6f, powf(luma / csp_max, (1 - y) / y));
+        luma = powf(fmaxf(1e-6f, luma / csp_max), (1 - y) / y);
         MAP3(12 / csp_max * luma * X);
         // OETF
         MAP3(X > 1 ? HLG_A * logf(X - HLG_B) + HLG_C : 0.5f * sqrtf(X));
@@ -1659,11 +1688,15 @@ bool pl_primaries_superset(const struct pl_raw_primaries *a,
 
 bool pl_primaries_valid(const struct pl_raw_primaries *prim)
 {
-    // Test to see if the primaries form a valid triangle (nonzero area)
-    float area = (prim->blue.x - prim->green.x) * (prim->red.y  - prim->green.y)
-               - (prim->red.x  - prim->green.x) * (prim->blue.y - prim->green.y);
+    // The white point must lie strictly inside the triangle spanned by the
+    // primaries, otherwise the RGB<->XYZ matrix is singular. This also rejects
+    // a degenerate triangle, as the three signed areas sum to its area.
+    float d1 = test_point_line(prim->white, prim->red,   prim->green),
+          d2 = test_point_line(prim->white, prim->green, prim->blue),
+          d3 = test_point_line(prim->white, prim->blue,  prim->red);
 
-    return fabs(area) > 1e-6 && test_point_gamut(prim->white, prim);
+    return (d1 >  1e-6f && d2 >  1e-6f && d3 >  1e-6f) ||
+           (d1 < -1e-6f && d2 < -1e-6f && d3 < -1e-6f);
 }
 
 static inline float xy_dist2(struct pl_cie_xy a, struct pl_cie_xy b)
@@ -1777,7 +1810,18 @@ static inline void apply_hue_sat(pl_matrix3x3 *m,
 pl_transform3x3 pl_color_repr_decode(struct pl_color_repr *repr,
                                      const struct pl_color_adjustment *params)
 {
-    params = PL_DEF(params, &pl_color_adjustment_neutral);
+    return pl_color_repr_decode_ex(repr, pl_color_repr_decode_params(
+        .adjustment = params,
+    ));
+}
+
+pl_transform3x3 pl_color_repr_decode_ex(struct pl_color_repr *repr,
+                                        const struct pl_color_repr_decode_params *dparams)
+{
+    static const struct pl_color_repr_decode_params dparams_def = {0};
+    dparams = PL_DEF(dparams, &dparams_def);
+    const struct pl_color_adjustment *params =
+        PL_DEF(dparams->adjustment, &pl_color_adjustment_neutral);
 
     pl_matrix3x3 m;
     switch (repr->sys) {
@@ -1838,10 +1882,11 @@ pl_transform3x3 pl_color_repr_decode(struct pl_color_repr *repr,
         m = pl_matrix3x3_identity;
         break;
     case PL_COLOR_SYSTEM_XYZ: {
-        // For lack of anything saner to do, just assume the caller wants
-        // DCI-P3 primaries, which is a reasonable assumption.
-        const struct pl_raw_primaries *dst = pl_raw_primaries_get(PL_COLOR_PRIM_DCI_P3);
-        m = pl_get_xyz2rgb_matrix(dst);
+        // XYZ is device-independent, so the choice of primaries here decides
+        // the adopted white point (which XYZ value becomes RGB white). Default
+        // to DCI-P3, the reference space of DCDM X'Y'Z' (ST 428-1).
+        enum pl_color_primaries prim = PL_DEF(dparams->primaries, PL_COLOR_PRIM_DCI_P3);
+        m = pl_get_xyz2rgb_matrix(pl_raw_primaries_get(prim));
         break;
     }
     case PL_COLOR_SYSTEM_COUNT:
@@ -1919,11 +1964,12 @@ pl_transform3x3 pl_color_repr_decode(struct pl_color_repr *repr,
 
 #ifdef PL_HAVE_DOVI
     if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION) {
-        // The RPU matrix already includes levels normalization, but in this
-        // case we also have to respect the signalled color offsets
+        // The RPU matrix already includes levels normalization, and the
+        // signalled color offsets are in units of the composed signal
         for (int i = 0; i < 3; i++) {
             mul[i] = 1.0;
-            black[i] = repr->dovi->nonlinear_offset[i] * scale;
+            black[i] = repr->dovi->nonlinear_offset[i] *
+                       (repr->dovi->cb1_normalized ? scale : 1.0f);
         }
     } else
 #endif

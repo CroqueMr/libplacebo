@@ -394,12 +394,12 @@ static void generate_shaders(pl_dispatch dp,
                  "precision mediump float;          \n"
                  "#endif                            \n");
 
-        // Always use 16-bit precision for samplers
-        ADD(pre, "precision mediump sampler2D; \n");
+        // GLSL ES returns texture lookups at the precision of the sampler
+        ADD(pre, "precision highp sampler2D; \n");
         if (gpu->limits.max_tex_1d_dim)
-            ADD(pre, "precision mediump sampler1D; \n");
+            ADD(pre, "precision highp sampler1D; \n");
         if (gpu->limits.max_tex_3d_dim && gpu->glsl.version > 100)
-            ADD(pre, "precision mediump sampler3D; \n");
+            ADD(pre, "precision highp sampler3D; \n");
 
         // Integer math has a good chance of caring about precision
         ADD(pre, "precision highp int; \n");
@@ -496,8 +496,7 @@ static void generate_shaders(pl_dispatch dp,
             if (gpu->glsl.vulkan) {
                 ADD(pre, "layout(binding=%d) uniform %c%s "$";\n",
                     desc->binding, prefix, type, id);
-            } else if (gpu->glsl.gles &&
-                       (prefix != ' ' || tex->params.format->component_depth[0] > 8)) {
+            } else if (gpu->glsl.gles) {
                 ADD(pre, "uniform highp %c%s "$";\n", prefix, type, id);
             } else {
                 ADD(pre, "uniform %c%s "$";\n", prefix, type, id);
@@ -1065,7 +1064,7 @@ static void compute_vertex_attribs(pl_dispatch dp, pl_shader sh,
         .dynamic = true,
     });
 
-    GLSLP("#define frag_pos(id) (vec2(id) + vec2(0.5))  \n"
+    GLSLG("#define frag_pos(id) (vec2(id) + vec2(0.5))  \n"
           "#define frag_map(id) ("$" * frag_pos(id))    \n"
           "#define gl_FragCoord vec4(frag_pos(gl_GlobalInvocationID), 0.0, 1.0) \n",
           *out_scale);
@@ -1081,7 +1080,7 @@ static void compute_vertex_attribs(pl_dispatch dp, pl_shader sh,
             });
         }
 
-        GLSLP("#define "$"_map(id) "
+        GLSLG("#define "$"_map(id) "
              "(mix(mix("$", "$", frag_map(id).x), "
              "     mix("$", "$", frag_map(id).x), "
              "frag_map(id).y)) \n"
@@ -1589,7 +1588,7 @@ bool pl_dispatch_vertex(pl_dispatch dp, const struct pl_dispatch_vertex_params *
         ident_t id = sh_fresh(sh, params->vertex_attribs[i].name);
         sh->vas.elem[i].attr = params->vertex_attribs[i];
         sh->vas.elem[i].attr.name = sh_ident_pack(id);
-        GLSLP("#define %s "$"\n", params->vertex_attribs[i].name, id);
+        GLSLG("#define %s "$"\n", params->vertex_attribs[i].name, id);
     }
 
     // Compute the coordinate projection matrix
