@@ -2223,6 +2223,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         isfinite(params->cb1_neutral_cm29_peak) &&
         params->cb1_neutral_cm29_peak > 0.0f &&
         params->cb1_neutral_cm29_peak <= 10000.0f;
+    const bool cb1_tone_path = explicit_tone || cb1_neutral_cm29 ||
+                               params->cb1_fp32_tone_lut || SH_PARAMS(sh).cb1_stable_pq;
     struct sh_color_map_obj *obj = NULL;
     if (args->state) {
         // Authored dynamic metadata takes precedence over the measurement,
@@ -2333,7 +2335,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     // linearly: trading some average brightness buys headroom for the tone
     // mapping and the highlights, which gives far better results than
     // compressing e.g. a 10000 nits source directly into a 203 nits target.
-    if (obj && scene_avg > 0 && !params->inverse_tone_mapping &&
+    if (!cb1_tone_path && obj && scene_avg > 0 && !params->inverse_tone_mapping &&
         tone.input_max > tone.output_max + 1e-4f)
     {
         // Smooth maximum of the display peak and a fixed perceptual (PQ)
@@ -2378,7 +2380,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     const int *lut3d_size_def = pl_color_map_default_params.lut3d_size;
     // Tone mapping and the gamut-mapping source extent share this space
     pl_matrix3x3 space_mat;
-    const bool use_mast_space = use_mastering_space(&src, &space_mat);
+    const bool use_mast_space = !cb1_tone_path && use_mastering_space(&src, &space_mat);
     const struct pl_raw_primaries *src_space = use_mast_space
         ? &src.hdr.prim : pl_raw_primaries_get(src.primaries);
 
@@ -2386,13 +2388,17 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         .function        = PL_DEF(params->gamut_mapping, &pl_gamut_map_clip),
         .constants       = params->gamut_constants,
         .input_gamut     = cb1_neutral_cm29 ?
-                           *pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020) : *src_space,
+                           *pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020) :
+                           cb1_tone_path ? src.hdr.prim : *src_space,
         .output_gamut    = dst.hdr.prim,
         .lut_size_I      = PL_DEF(params->lut3d_size[0], lut3d_size_def[0]),
         .lut_size_C      = PL_DEF(params->lut3d_size[1], lut3d_size_def[1]),
         .lut_size_h      = PL_DEF(params->lut3d_size[2], lut3d_size_def[2]),
         .lut_stride      = 3,
     };
+
+    if (cb1_tone_path && gamut.function == &pl_gamut_map_perceptual)
+        gamut.function = &pl_cb1_gamut_map_perceptual;
 
     float src_peak_static;
     pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
@@ -2516,7 +2522,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     // Mastering-peak soft clip: reproduce the as-mastered appearance by
     // folding per-channel excursions above the mastering display's peak
     // back toward it.
-    float mclip = PL_CLAMP(params->mastering_clip, 0.0f, 1.0f);
+    float mclip = cb1_tone_path ? 0.0f : PL_CLAMP(params->mastering_clip, 0.0f, 1.0f);
     const float master_nits = args->src.hdr.max_luma;
     if (mclip > 0.0f && master_nits > 0.0f && master_nits < 9999.0f &&
         obj && obj->peak.max_y_pq > 0.0f)
@@ -2664,77 +2670,99 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
             pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, tone.output_min);
         const float flare_frac = flare_nits / 10000.0f;
         const float film_str = PL_CLAMP(params->film_strength, 0.0f, 2.0f);
-        const pl_matrix3x3 lms2rgb_src = pl_ipt_lms2rgb(src_space);
+        if (cb1_tone_path) {
+            // The authored CB1 curve maps IPT intensity and keeps its chroma hull.
+            // The upstream default maps each cone channel independently.
+            GLSL("float i_orig = ipt.x; \n");
+            if (tone.input_max >= tone.output_max &&
+                params->contrast_recovery && args->feature_map)
+            {
+                sample_feature_map(sh, args->feature_map);
+                GLSL("float ih = clamp(ipt.x, 0.0, 1.0); \n"
+                     "float il = clamp(luma, 0.0, 1.0); \n"
+                     "float detail = ih - il; \n"
+                     "ipt.x = clamp(mix(tone_map(ih), tone_map(il) + detail, "$"), "$", "$"); \n",
+                     SH_FLOAT(params->contrast_recovery),
+                     SH_FLOAT(tone.output_min), SH_FLOAT_DYN(tone.output_max));
+            } else {
+                GLSL("ipt.x = tone_map(ipt.x); \n");
+            }
+            GLSL("vec2 hull = vec2(i_orig, ipt.x); \n"
+                 "hull = ((hull - 6.0) * hull + 9.0) * hull; \n"
+                 "ipt.yz *= min(i_orig / ipt.x, hull.y / hull.x); \n");
+        } else {
+            const pl_matrix3x3 lms2rgb_src = pl_ipt_lms2rgb(src_space);
 
-        const struct pl_tone_map_constants *tc = &tone.constants;
-        float knee = tone.input_avg ? tone.input_avg
-                   : PL_MIX(tone.input_min, tone.input_max, tc->knee_default);
-        knee = PL_CLAMP(knee,
-            PL_MIX(tone.input_min, tone.input_max, tc->knee_minimum),
-            PL_MIX(tone.input_min, tone.input_max, tc->knee_maximum));
-        const float knee_in  = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS,
-                                              knee) / 10000.0f;
-        const float knee_out = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS,
-            pl_tone_map_sample(knee, &tone)) / 10000.0f;
-        const float knee_gain = fmaxf(knee_out - flare_frac, 1e-9f) /
-                                fmaxf(knee_in, 1e-9f);
+            const struct pl_tone_map_constants *tc = &tone.constants;
+            float knee = tone.input_avg ? tone.input_avg
+                       : PL_MIX(tone.input_min, tone.input_max, tc->knee_default);
+            knee = PL_CLAMP(knee,
+                PL_MIX(tone.input_min, tone.input_max, tc->knee_minimum),
+                PL_MIX(tone.input_min, tone.input_max, tc->knee_maximum));
+            const float knee_in  = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS,
+                                                  knee) / 10000.0f;
+            const float knee_out = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS,
+                pl_tone_map_sample(knee, &tone)) / 10000.0f;
+            const float knee_gain = fmaxf(knee_out - flare_frac, 1e-9f) /
+                                    fmaxf(knee_in, 1e-9f);
 
-#pragma GLSL /* tone mapping */                                             \
-        @if (use_cr) {                                                      \
-            /* Detail-preserving recovery: shift down to the low-frequency  \
-             * level, tone map there, re-add the detail. */                 \
-            float tm_d = clamp(ipt.x, 0.0, 1.0) -                           \
-                         clamp(luma, 0.0, 1.0);                             \
-            vec3 tm_lo = clamp(lmspq - vec3(tm_d), 0.0, 1.0);               \
-            vec3 tm_o = mix(vec3(tone_map(lmspq.x), tone_map(lmspq.y),      \
-                                 tone_map(lmspq.z)),                        \
-                            vec3(tone_map(tm_lo.x), tone_map(tm_lo.y),      \
-                                 tone_map(tm_lo.z)) + (lmspq - tm_lo),      \
-                            ${float: params->contrast_recovery});           \
-            tm_o = clamp(tm_o, ${dynamic float: tone.output_min},           \
-                         ${dynamic float: tone.output_max});                \
-        @} else {                                                           \
-            vec3 tm_o = vec3(tone_map(lmspq.x), tone_map(lmspq.y),          \
-                             tone_map(lmspq.z));                            \
-        @}                                                                  \
-        tm_o = pow(tm_o, vec3(1.0 / ${const float: PQ_M2}));                \
-        tm_o = pow(max(tm_o - ${const float: PQ_C1}, 0.0) /                 \
-                   (${const float: PQ_C2} - ${const float: PQ_C3} * tm_o),  \
-                   vec3(1.0 / ${const float: PQ_M1}));                      \
-        /* Chromaticity-preserving endpoint: the maximum RGB channel's      \
-         * gain, so the output channel range is bounded by the curve for    \
-         * any hue */                                                       \
-        float tm_lx = clamp(${const float: PL_COLOR_SDR_WHITE / 10000.0} *  \
-                            max(color.r, max(color.g, color.b)), 0.0, 1.0); \
-        float tm_vx = pow(tm_lx, ${const float: PQ_M1});                    \
-        tm_vx = (${const float: PQ_C1} + ${const float: PQ_C2} * tm_vx) /   \
-                (1.0 + ${const float: PQ_C3} * tm_vx);                      \
-        float tm_ox = tone_map(pow(tm_vx, ${const float: PQ_M2}));          \
-        tm_ox = pow(tm_ox, 1.0 / ${const float: PQ_M2});                    \
-        tm_ox = pow(max(tm_ox - ${const float: PQ_C1}, 0.0) /               \
-                    (${const float: PQ_C2} - ${const float: PQ_C3} * tm_ox),\
-                    1.0 / ${const float: PQ_M1});                           \
-        float tm_fl = ${dynamic float: flare_frac};                         \
-        float tm_ga = max(tm_ox - tm_fl, 0.0) / max(tm_lx, 1e-9);           \
-        /* The film response weight, per cone channel: proportional to the  \
-         * cone's own source ratio, ramping to the full response as the     \
-         * shoulder attenuation deepens. */                                 \
-        float tm_u = tm_lx > ${dynamic float: knee_in}                      \
-            ? clamp(1.0 - tm_ga * ${dynamic float: 1.0f / knee_gain}, 0.0, 1.0) \
-            : 0.0;                                                          \
-        tm_u *= tm_u;                                                       \
-        vec3 tm_s = clamp(lms * (1.0 /                                      \
-                          max(max(lms.x, max(lms.y, lms.z)), 1e-9)),        \
-                          0.0, 1.0);                                        \
-        vec3 tm_w = ${const float: film_str} * mix(tm_s, vec3(1.0), tm_u);  \
-        vec3 tm_r = mix(lms * (tm_ga *                                      \
-                               ${const float: PL_COLOR_SDR_WHITE / 10000.0}),\
-                        tm_o - vec3(tm_fl), tm_w);                          \
-        float tm_e = ${dynamic float: dt_exposure * 10000.0f / PL_COLOR_SDR_WHITE}; \
-        color.rgb = tm_e * (${SH_MAT3(lms2rgb_src)} *                       \
-                            (vec3(tm_fl) + tm_r));
+    #pragma GLSL /* tone mapping */                                             \
+            @if (use_cr) {                                                      \
+                /* Detail-preserving recovery: shift down to the low-frequency  \
+                 * level, tone map there, re-add the detail. */                 \
+                float tm_d = clamp(ipt.x, 0.0, 1.0) -                           \
+                             clamp(luma, 0.0, 1.0);                             \
+                vec3 tm_lo = clamp(lmspq - vec3(tm_d), 0.0, 1.0);               \
+                vec3 tm_o = mix(vec3(tone_map(lmspq.x), tone_map(lmspq.y),      \
+                                     tone_map(lmspq.z)),                        \
+                                vec3(tone_map(tm_lo.x), tone_map(tm_lo.y),      \
+                                     tone_map(tm_lo.z)) + (lmspq - tm_lo),      \
+                                ${float: params->contrast_recovery});           \
+                tm_o = clamp(tm_o, ${dynamic float: tone.output_min},           \
+                             ${dynamic float: tone.output_max});                \
+            @} else {                                                           \
+                vec3 tm_o = vec3(tone_map(lmspq.x), tone_map(lmspq.y),          \
+                                 tone_map(lmspq.z));                            \
+            @}                                                                  \
+            tm_o = pow(tm_o, vec3(1.0 / ${const float: PQ_M2}));                \
+            tm_o = pow(max(tm_o - ${const float: PQ_C1}, 0.0) /                 \
+                       (${const float: PQ_C2} - ${const float: PQ_C3} * tm_o),  \
+                       vec3(1.0 / ${const float: PQ_M1}));                      \
+            /* Chromaticity-preserving endpoint: the maximum RGB channel's      \
+             * gain, so the output channel range is bounded by the curve for    \
+             * any hue */                                                       \
+            float tm_lx = clamp(${const float: PL_COLOR_SDR_WHITE / 10000.0} *  \
+                                max(color.r, max(color.g, color.b)), 0.0, 1.0); \
+            float tm_vx = pow(tm_lx, ${const float: PQ_M1});                    \
+            tm_vx = (${const float: PQ_C1} + ${const float: PQ_C2} * tm_vx) /   \
+                    (1.0 + ${const float: PQ_C3} * tm_vx);                      \
+            float tm_ox = tone_map(pow(tm_vx, ${const float: PQ_M2}));          \
+            tm_ox = pow(tm_ox, 1.0 / ${const float: PQ_M2});                    \
+            tm_ox = pow(max(tm_ox - ${const float: PQ_C1}, 0.0) /               \
+                        (${const float: PQ_C2} - ${const float: PQ_C3} * tm_ox),\
+                        1.0 / ${const float: PQ_M1});                           \
+            float tm_fl = ${dynamic float: flare_frac};                         \
+            float tm_ga = max(tm_ox - tm_fl, 0.0) / max(tm_lx, 1e-9);           \
+            /* The film response weight, per cone channel: proportional to the  \
+             * cone's own source ratio, ramping to the full response as the     \
+             * shoulder attenuation deepens. */                                 \
+            float tm_u = tm_lx > ${dynamic float: knee_in}                      \
+                ? clamp(1.0 - tm_ga * ${dynamic float: 1.0f / knee_gain}, 0.0, 1.0) \
+                : 0.0;                                                          \
+            tm_u *= tm_u;                                                       \
+            vec3 tm_s = clamp(lms * (1.0 /                                      \
+                              max(max(lms.x, max(lms.y, lms.z)), 1e-9)),        \
+                              0.0, 1.0);                                        \
+            vec3 tm_w = ${const float: film_str} * mix(tm_s, vec3(1.0), tm_u);  \
+            vec3 tm_r = mix(lms * (tm_ga *                                      \
+                                   ${const float: PL_COLOR_SDR_WHITE / 10000.0}),\
+                            tm_o - vec3(tm_fl), tm_w);                          \
+            float tm_e = ${dynamic float: dt_exposure * 10000.0f / PL_COLOR_SDR_WHITE}; \
+            color.rgb = tm_e * (${SH_MAT3(lms2rgb_src)} *                       \
+                                (vec3(tm_fl) + tm_r));
 
-        ipt_convert(sh, rgb2lms_i, lms2ipt, false);
+            ipt_convert(sh, rgb2lms_i, lms2ipt, false);
+        }
     }
 
     if (cb1_neutral_cm29 && need_tone_map) {

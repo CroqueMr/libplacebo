@@ -19,6 +19,8 @@
 
 #include <libplacebo/colorspace.h>
 
+extern const struct pl_gamut_map_function pl_cb1_gamut_map_perceptual;
+
 // PL_COLOR_HDR_BLACK is used as a sentinel for "infinite contrast", because a
 // nominal black point of exactly 0.0 instead signals "unspecified". This
 // function clips all values below PL_COLOR_HDR_BLACK as they are virtually all
