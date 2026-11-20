@@ -109,7 +109,6 @@ PL_LIBAV_API void pl_map_hdr_metadata(struct pl_hdr_metadata *out,
 
 #ifdef PL_HAVE_LAV_DOLBY_VISION
 // Map metadata for CB1's normalized BL and EL shader inputs.
-#define PL_HAVE_CB1_NORMALIZED_DOVI 1
 PL_LIBAV_API void pl_cb1_map_dovi_metadata(struct pl_dovi_metadata *out,
                                           const AVDOVIMetadata *metadata);
 PL_LIBAV_API void pl_cb1_map_avdovi_metadata(struct pl_color_space *color,

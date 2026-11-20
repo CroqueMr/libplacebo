@@ -899,7 +899,7 @@ static void pl_shader_tests(pl_gpu gpu)
         pl_shader_decode_color_ex(sh, pl_color_decode_args( .repr = &pq_repr ));
         const struct pl_shader_res *pq = pl_shader_finalize(sh);
         REQUIRE(pq && pq->glsl);
-        REQUIRE(strstr(pq->glsl, "pow(max(color.rgb, 0.0), vec3(0.159302"));
+        REQUIRE(strstr(pq->glsl, "pow(max(color.rgb, 0.0), vec3(0.15930"));
         pl_dispatch_abort(dp, &sh);
 
         struct pl_color_repr linear_repr = {
@@ -916,11 +916,15 @@ static void pl_shader_tests(pl_gpu gpu)
         REQUIRE(linear && linear->glsl);
         REQUIRE(strstr(linear->glsl, "color.rgb = max(color.rgb, 0.0) * vec3("));
         REQUIRE(strstr(linear->glsl, "49.261"));
-        REQUIRE(!strstr(linear->glsl, "pow(max(color.rgb, 0.0), vec3(0.159302"));
+        REQUIRE(!strstr(linear->glsl, "pow(max(color.rgb, 0.0), vec3(0.15930"));
         REQUIRE(strstr(linear->glsl, "78.84375"));
+        const float first_column[] = {3.06441879f, -0.65612108f, 0.01736321f};
         bool has_lms_matrix = false;
-        for (int i = 0; i < linear->num_variables; i++)
-            has_lms_matrix |= !strcmp(linear->variables[i].var.name, "lms2rgb");
+        for (int i = 0; i < linear->num_variables; i++) {
+            const struct pl_shader_var *var = &linear->variables[i];
+            has_lms_matrix |= var->var.dim_m == 3 && var->var.dim_v == 3 &&
+                              !memcmp(var->data, first_column, sizeof(first_column));
+        }
         REQUIRE(has_lms_matrix);
         pl_dispatch_abort(dp, &sh);
     }
@@ -2779,6 +2783,34 @@ static void pl_dovi_tests(pl_gpu gpu)
 
     pl_dispatch dp = pl_dispatch_create(gpu->log, gpu);
     REQUIRE(dp);
+
+    // The fast univariate path must use the same bounds as the general path.
+    struct pl_dovi_metadata mmr = {0};
+    mmr.comp[0].num_pivots = 2;
+    mmr.comp[0].pivots[0] = 0.25f;
+    mmr.comp[0].pivots[1] = 0.75f;
+    mmr.comp[0].method[0] = 1;
+    mmr.comp[0].mmr_order[0] = 1;
+    mmr.comp[0].mmr_constant[0] = 0.875f;
+    pl_tex pixel = pl_tex_create(gpu, pl_tex_params(
+        .format = fbo_fmt, .w = 1, .h = 1, .renderable = true, .host_readable = true,
+    ));
+    REQUIRE(pixel);
+    for (int mode = 0; mode < 2; mode++) {
+        mmr.cb1_normalized = mode;
+        pl_shader sh = pl_dispatch_begin(dp);
+        REQUIRE(pl_shader_custom(sh, &(struct pl_custom_shader) {
+            .input = PL_SHADER_SIG_NONE,
+            .output = PL_SHADER_SIG_COLOR,
+            .body = "color = vec4(0.5);",
+        }));
+        pl_shader_dovi_reshape(sh, &mmr);
+        REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = pixel)));
+        float value[4];
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = pixel, .ptr = value)));
+        REQUIRE_FEQ(value[0], mode ? 0.75f : 0.875f, 1e-6f);
+    }
+    pl_tex_destroy(gpu, &pixel);
 
     static const struct {
         int depth, tex_bits, shift;

@@ -219,7 +219,12 @@ float pl_color_repr_normalize(struct pl_color_repr *repr)
 
     // The result is a signal of the sample depth when limited range, and of
     // the color depth when full range
-    if (bits->sample_depth || bits->color_depth)
+    bool preserve_sample_depth = false;
+#ifdef PL_HAVE_DOVI
+    preserve_sample_depth = repr->sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+                            repr->dovi && repr->dovi->cb1_normalized;
+#endif
+    if (!preserve_sample_depth && (bits->sample_depth || bits->color_depth))
         bits->sample_depth = limited ? tex_bits : col_bits;
     bits->color_depth = bits->sample_depth;
     return scale;

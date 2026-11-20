@@ -170,7 +170,7 @@ static inline void reshape_poly(pl_shader sh)
 }
 
 static bool reshape_univariate_mmr(pl_shader sh, const struct pl_reshape_data *comp,
-                                  int channel)
+                                  int channel, float low, float high)
 {
     if (comp->num_pivots != 2 || comp->method[0] != 1 ||
         comp->mmr_order[0] < 1 || comp->mmr_order[0] > 3)
@@ -188,7 +188,7 @@ static bool reshape_univariate_mmr(pl_shader sh, const struct pl_reshape_data *c
     ident_t coeff = sh_var(sh, (struct pl_shader_var) {
         .var = pl_var_vec4("univariate_mmr"), .data = values,
     });
-    float bounds[2] = {comp->pivots[0], comp->pivots[1]};
+    float bounds[2] = {low, high};
     ident_t limits = sh_var(sh, (struct pl_shader_var) {
         .var = pl_var_vec2("univariate_bounds"), .data = bounds,
     });
@@ -264,16 +264,17 @@ void sh_dovi_compose_nlq(pl_shader sh, const struct pl_dovi_metadata *data,
 /* Evaluate the processing ABI's axis tables and the remaining MMR cross terms.
  * Keep axis/order accumulation and clamping identical to the numerical contract. */
 static bool cb1_reshape_texture(pl_shader sh, const struct pl_cb1_dovi_processing *p,
-                               const struct pl_reshape_data *curve, int channel, ident_t texture)
+                               const struct pl_reshape_data *curve, int channel, ident_t texture,
+                               float low, float high)
 {
     if (!p || !texture) return false;
     unsigned component = 1u << channel;
     if (p->poly_components & component) {
         ident_t row = SH_FLOAT((channel * 3 + 0.5) / 9.0);
-        ident_t low = SH_FLOAT_DYN(curve->pivots[0]);
-        ident_t high = SH_FLOAT_DYN(curve->pivots[curve->num_pivots - 1]);
+        ident_t lo = SH_FLOAT_DYN(low);
+        ident_t hi = SH_FLOAT_DYN(high);
         GLSL("color[%d]=clamp(texture("$",vec2((sig[%d]*1023.0+0.5)/1024.0,"$")).r,"$","$");\n",
-             channel, texture, channel, row, low, high);
+             channel, texture, channel, row, lo, hi);
         return true;
     }
     if (!(p->narrow_components & component)) return false;
@@ -289,9 +290,9 @@ static bool cb1_reshape_texture(pl_shader sh, const struct pl_cb1_dovi_processin
             .data=&curve->mmr_coeffs[0][order][3]});
         GLSL("s+=dot("$",%s);\n", weights, terms[order]);
     }
-    ident_t low = SH_FLOAT_DYN(curve->pivots[0]);
-    ident_t high = SH_FLOAT_DYN(curve->pivots[curve->num_pivots - 1]);
-    GLSL("color[%d]=clamp(s,"$","$");}\n", channel, low, high);
+    ident_t lo = SH_FLOAT_DYN(low);
+    ident_t hi = SH_FLOAT_DYN(high);
+    GLSL("color[%d]=clamp(s,"$","$");}\n", channel, lo, hi);
     return true;
 }
 
@@ -396,10 +397,13 @@ static void dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data,
             GLSL("color[%d] = sig[%d]; \n", c, c);
             continue;
         }
-        if (cb1_reshape_texture(sh, processing, comp, c, mmr_lut)) {
+        const bool cb1_output_bounds = data->cb1_normalized && !data->cb1_native_bounds;
+        const float out_lo = cb1_output_bounds ? comp->pivots[0] : 0.0f;
+        const float out_hi = cb1_output_bounds ? comp->pivots[comp->num_pivots - 1] : 1.0f;
+        if (cb1_reshape_texture(sh, processing, comp, c, mmr_lut, out_lo, out_hi)) {
             continue;
         }
-        if (reshape_univariate_mmr(sh, comp, c))
+        if (reshape_univariate_mmr(sh, comp, c, out_lo, out_hi))
             continue;
         GLSL("s = sig[%d]; \n", c);
 
@@ -535,7 +539,8 @@ static void dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data,
             GLSL("} \n");
         }
 
-        GLSL("color[%d] = clamp(s, 0.0, 1.0); \n", c);
+        GLSL("color[%d] = clamp(s, "$", "$"); \n", c,
+             SH_FLOAT_DYN(out_lo), SH_FLOAT_DYN(out_hi));
     }
 
     GLSL("} \n");

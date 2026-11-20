@@ -191,6 +191,7 @@ struct pl_dovi_metadata {
 #define PL_HAVE_CB1_NATIVE_BOUNDS 1
     bool cb1_native_bounds;
     // Normalized BL pivots and EL units produced by the CB1 FFmpeg mapper.
+#define PL_HAVE_CB1_NORMALIZED_DOVI 1
     bool cb1_normalized;
 };
 

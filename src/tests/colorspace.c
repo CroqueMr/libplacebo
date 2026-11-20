@@ -43,6 +43,26 @@ static void ycgco_r_to_rgb(float y, float cg, float co, float *r, float *g,
 
 int main()
 {
+#ifdef PL_HAVE_DOVI
+    struct pl_dovi_metadata cb1 = {.cb1_normalized = true};
+    for (int c = 0; c < 3; c++) {
+        cb1.nonlinear.m[c][c] = cb1.linear.m[c][c] = 1.0f;
+        cb1.nonlinear_offset[c] = 0.5f;
+    }
+    for (int shift = 0; shift <= 6; shift += 6) {
+        struct pl_color_repr repr = {
+            .sys = PL_COLOR_SYSTEM_DOLBYVISION, .levels = PL_COLOR_LEVELS_FULL, .dovi = &cb1,
+            .bits = {.sample_depth = 16, .color_depth = 10, .bit_shift = shift},
+        };
+        pl_color_repr_normalize(&repr);
+        REQUIRE_CMP(repr.bits.sample_depth, ==, 16, "d");
+        REQUIRE_CMP(repr.bits.color_depth, ==, 16, "d");
+        REQUIRE_CMP(repr.bits.bit_shift, ==, 0, "d");
+        pl_color_repr_normalize(&repr);
+        pl_transform3x3 decoded = pl_color_repr_decode(&repr, NULL);
+        REQUIRE_FEQ(decoded.c[0], -32768.0f / 65535.0f, 1e-7f);
+    }
+#endif
     for (enum pl_color_system sys = 0; sys < PL_COLOR_SYSTEM_COUNT; sys++) {
         bool ycbcr = sys >= PL_COLOR_SYSTEM_BT_601 && sys <= PL_COLOR_SYSTEM_YCGCO_RO;
         REQUIRE_CMP(ycbcr, ==, pl_color_system_is_ycbcr_like(sys), "d");

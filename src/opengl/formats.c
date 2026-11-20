@@ -314,11 +314,6 @@ static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
     for (int i = 0; i < fmt->num_components; i++)
         fmt->host_bits[i] = size * 8;
 
-    if (p->gles_ver >= 30 && fmt->type == PL_FMT_FLOAT &&
-        fmt->component_depth[0] == 32 && (fmt->caps & PL_FMT_CAP_SAMPLEABLE) &&
-        pl_opengl_has_ext(p->gl, "GL_OES_texture_float_linear"))
-        fmt->caps |= PL_FMT_CAP_LINEAR;
-
     // Compute internal size by summing up the depth
     int ibits = 0;
     for (int i = 0; i < fmt->num_components; i++)

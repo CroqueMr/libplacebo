@@ -207,6 +207,20 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
     limits->thread_safe = params->make_current;
     limits->callbacks = gl_test_ext(gpu, "GL_ARB_sync", 32, 30);
     limits->align_vertex_stride = 1;
+    if (gl_test_ext(gpu, "GL_ARB_buffer_storage", 44, 0)) {
+        p->buffer_storage = gl->BufferStorage;
+    } else if (gl_test_ext(gpu, "GL_EXT_buffer_storage", 0, 0)) {
+        const struct gl_ctx *ctx = PL_PRIV(p->gl);
+        const struct pl_opengl_params *resolver = &ctx->params;
+        if (resolver->get_proc_addr_ex) {
+            p->buffer_storage = (PFNGLBUFFERSTORAGEPROC)
+                resolver->get_proc_addr_ex(resolver->proc_ctx, "glBufferStorageEXT");
+        } else if (resolver->get_proc_addr) {
+            p->buffer_storage = (PFNGLBUFFERSTORAGEPROC)
+                resolver->get_proc_addr("glBufferStorageEXT");
+        }
+    }
+
     if (gl_test_ext(gpu, "GL_ARB_pixel_buffer_object", 31, 30)) {
         limits->max_buf_size = SIZE_MAX; // no restriction imposed by GL
         if (gl_test_ext(gpu, "GL_ARB_uniform_buffer_object", 31, 30))
@@ -217,8 +231,7 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
             get(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &limits->max_ssbo_size);
         }
         limits->max_vbo_size = limits->max_buf_size; // No additional restrictions
-        if (gl_test_ext(gpu, "GL_ARB_buffer_storage", 44, 0) ||
-            gl_test_ext(gpu, "GL_EXT_buffer_storage", 0, 0)) {
+        if (p->buffer_storage) {
             limits->max_mapped_size = limits->max_buf_size;
             limits->max_mapped_vram = limits->max_buf_size;
             limits->host_cached = strcmp(vendor, "AMD") == 0 ||
@@ -397,17 +410,7 @@ pl_buf gl_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
     gl->GenBuffers(1, &buf_gl->buffer);
     gl->BindBuffer(target, buf_gl->buffer);
 
-    PFNGLBUFFERSTORAGEPROC storage=NULL;
-    if (gl_test_ext(gpu,"GL_ARB_buffer_storage",44,0)) {
-        storage=gl->BufferStorage;
-    } else if (gl_test_ext(gpu,"GL_EXT_buffer_storage",0,0)) {
-        const struct gl_ctx *ctx=PL_PRIV(p->gl);
-        if (ctx->params.get_proc_addr_ex)
-            storage=(PFNGLBUFFERSTORAGEPROC)ctx->params.get_proc_addr_ex(ctx->params.proc_ctx,"glBufferStorageEXT");
-        else if (ctx->params.get_proc_addr)
-            storage=(PFNGLBUFFERSTORAGEPROC)ctx->params.get_proc_addr("glBufferStorageEXT");
-    }
-    if (storage && !import) {
+    if (p->buffer_storage && !import) {
 
         GLbitfield mapflags = 0, storflags = 0;
         if (params->host_writable)
@@ -416,10 +419,12 @@ pl_buf gl_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
             mapflags |= GL_MAP_READ_BIT | GL_MAP_WRITE_BIT |
                         GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
         }
+        if (p->gles_ver && params->host_readable)
+            storflags |= GL_MAP_READ_BIT;
         if (params->memory_type == PL_BUF_MEM_HOST)
             storflags |= GL_CLIENT_STORAGE_BIT; // hopefully this works
 
-        storage(target, total_size, data, storflags | mapflags);
+        p->buffer_storage(target, total_size, data, storflags | mapflags);
 
         if (params->host_mapped) {
             buf_gl->mapped = true;
@@ -525,17 +530,36 @@ void gl_buf_write(pl_gpu gpu, pl_buf buf, size_t offset,
 bool gl_buf_read(pl_gpu gpu, pl_buf buf, size_t offset,
                  void *dest, size_t size)
 {
+    if (!size)
+        return true;
+
     const gl_funcs *gl = gl_funcs_get(gpu);
     if (!MAKE_CURRENT())
         return false;
 
     struct pl_buf_gl *buf_gl = PL_PRIV(buf);
+    struct pl_gl *p = PL_PRIV(gpu);
+    bool ok = true;
     gl->BindBuffer(GL_ARRAY_BUFFER, buf_gl->buffer);
-    gl->GetBufferSubData(GL_ARRAY_BUFFER, buf_gl->offset + offset, size, dest);
+    if (!p->gles_ver) {
+        gl->GetBufferSubData(GL_ARRAY_BUFFER, buf_gl->offset + offset, size, dest);
+    } else if (buf->data) {
+        // An existing persistent mapping cannot be mapped again.
+        gl->Finish();
+        memcpy(dest, (const char *) buf->data + offset, size);
+    } else {
+        const void *mapped = gl->MapBufferRange(GL_ARRAY_BUFFER, buf_gl->offset + offset,
+                                               size, GL_MAP_READ_BIT);
+        ok = mapped != NULL;
+        if (ok) {
+            memcpy(dest, mapped, size);
+            ok = gl->UnmapBuffer(GL_ARRAY_BUFFER);
+        }
+    }
     gl->BindBuffer(GL_ARRAY_BUFFER, 0);
-    bool ok = gl_check_err(gpu, "gl_buf_read");
+    bool no_error = gl_check_err(gpu, "gl_buf_read");
     RELEASE_CURRENT();
-    return ok;
+    return ok && no_error;
 }
 
 void gl_buf_copy(pl_gpu gpu, pl_buf dst, size_t dst_offset,
