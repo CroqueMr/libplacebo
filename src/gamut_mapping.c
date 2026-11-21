@@ -708,7 +708,8 @@ done:
     };
 }
 
-static void perceptual(float *lut, const struct pl_gamut_map_params *params)
+static void perceptual_map(float *lut, const struct pl_gamut_map_params *params,
+                           bool cb1_fold)
 {
     const struct pl_gamut_map_constants *c = &params->constants;
     struct cache cache;
@@ -730,13 +731,44 @@ static void perceptual(float *lut, const struct pl_gamut_map_params *params)
         ipt.T = PL_MIX(ipt.T, mapped.T, k);
 
         struct RGB rgb = ipt2rgb(ipt, dst);
-        const float maxRGB = fmaxf(rgb.R, fmaxf(rgb.G, rgb.B));
-        rgb.R = fmaxf(softclip(rgb.R, maxRGB, dst.max_rgb, c), dst.min_rgb);
-        rgb.G = fmaxf(softclip(rgb.G, maxRGB, dst.max_rgb, c), dst.min_rgb);
-        rgb.B = fmaxf(softclip(rgb.B, maxRGB, dst.max_rgb, c), dst.min_rgb);
+        const float mx = fmaxf(rgb.R, fmaxf(rgb.G, rgb.B));
+        if (cb1_fold) {
+            rgb.R = fmaxf(softclip(rgb.R, mx, dst.max_rgb, c), dst.min_rgb);
+            rgb.G = fmaxf(softclip(rgb.G, mx, dst.max_rgb, c), dst.min_rgb);
+            rgb.B = fmaxf(softclip(rgb.B, mx, dst.max_rgb, c), dst.min_rgb);
+        } else {
+            // Fold over-range channels within the source gamut's extent at this hue
+            struct RGB speak = ipt2rgb(ich2ipt(src_peak), dst);
+            const float mn = fminf(rgb.R, fminf(rgb.G, rgb.B));
+            const float sat = 1.0f - fmaxf(mn, 0.0f) / fmaxf(mx, 1e-6f);
+            const float ext = fmaxf(fmaxf(speak.R, fmaxf(speak.G, speak.B)), mx);
+            rgb.R = PL_MIX(rgb.R, softclip(rgb.R, ext, dst.max_rgb, c), sat);
+            rgb.G = PL_MIX(rgb.G, softclip(rgb.G, ext, dst.max_rgb, c), sat);
+            rgb.B = PL_MIX(rgb.B, softclip(rgb.B, ext, dst.max_rgb, c), sat);
+            rgb.R = fminf(fmaxf(rgb.R, dst.min_rgb), dst.max_rgb);
+            rgb.G = fminf(fmaxf(rgb.G, dst.min_rgb), dst.max_rgb);
+            rgb.B = fminf(fmaxf(rgb.B, dst.min_rgb), dst.max_rgb);
+        }
         ipt = rgb2ipt(rgb, dst);
     }
 }
+
+static void perceptual(float *lut, const struct pl_gamut_map_params *params)
+{
+    perceptual_map(lut, params, false);
+}
+
+static void cb1_perceptual(float *lut, const struct pl_gamut_map_params *params)
+{
+    perceptual_map(lut, params, true);
+}
+
+const struct pl_gamut_map_function pl_cb1_gamut_map_perceptual = {
+    .name = "cb1-perceptual",
+    .description = "CB1 perceptual mapping",
+    .bidirectional = true,
+    .map = cb1_perceptual,
+};
 
 const struct pl_gamut_map_function pl_gamut_map_perceptual = {
     .name = "perceptual",

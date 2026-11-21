@@ -19,6 +19,8 @@
 
 #include <libplacebo/colorspace.h>
 
+extern const struct pl_gamut_map_function pl_cb1_gamut_map_perceptual;
+
 // PL_COLOR_HDR_BLACK is used as a sentinel for "infinite contrast", because a
 // nominal black point of exactly 0.0 instead signals "unspecified". This
 // function clips all values below PL_COLOR_HDR_BLACK as they are virtually all
@@ -53,3 +55,7 @@ static const float SLOG_A = 0.432699,
                    SLOG_P = 3.538813,
                    SLOG_Q = 0.030001,
                    SLOG_K2 = 155.0 / 219.0;
+
+// Factor from a texture sample to the integer code it holds, and the depth of
+// that code. Normalizes `repr->bits` like pl_color_repr_normalize().
+float pl_color_repr_code_scale(struct pl_color_repr *repr, int *out_depth);
